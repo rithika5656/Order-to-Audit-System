@@ -13,6 +13,7 @@ NutriLedger connects sales orders, GST billing, purchasing, production and stock
 - BOM-driven production runs, actual-material issues, damaged pouch issues and yield/material variances.
 - Order submission with stock warning, approval checks, GST invoicing, partial dispatch and payments.
 - Invoice PDF download, GST/sales/production/receivables summaries and audit logs.
+- Responsive enterprise interface using a dark-navy and royal-blue design system.
 - PostgreSQL Docker Compose setup, Alembic migration entry point and automated benchmark tests.
 
 The UI currently exposes the operational flows above, with report exports for sales, production, stock ledger and receivables.

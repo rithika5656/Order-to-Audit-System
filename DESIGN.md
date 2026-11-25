@@ -4,6 +4,10 @@
 
 The React application calls a FastAPI JSON API over HTTP. FastAPI validates request bodies, applies role dependencies and uses SQLAlchemy sessions to perform business operations. PostgreSQL is the deployment database; tests use an isolated SQLite database. SQLAlchemy models live in `backend/app/models.py`, HTTP routes in `backend/app/main.py`, and calculation helpers in `backend/app/services.py`.
 
+## Visual system
+
+The shared interface uses dark navy (`#101D38`) and midnight blue (`#172B4D`) for navigation and primary text, royal blue (`#2864B4`) for actions and active navigation, steel blue (`#3979C9`) and light blue (`#83B5FF`) for accents, and off-white/white surfaces. Amber and red are reserved for warning and critical statuses. Green and teal accents are intentionally excluded.
+
 ## Core relationships
 
 - A customer places orders; each order refers to one customer and product.
