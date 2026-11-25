@@ -22,7 +22,10 @@ from .services import add_movement, available_for_order, balance, bom_expected, 
 
 
 app = FastAPI(title="NutriLedger API", version="1.0.0")
-origins = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+origins = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:5173,http://localhost:8080,http://127.0.0.1:8080",
+).split(",")
 app.add_middleware(
     CORSMiddleware, allow_origins=origins, allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
