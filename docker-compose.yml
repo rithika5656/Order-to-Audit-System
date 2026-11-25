@@ -1,0 +1,41 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: nutriledger
+      POSTGRES_USER: nutriledger
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nutriledger-local}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nutriledger -d nutriledger"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://nutriledger:${POSTGRES_PASSWORD:-nutriledger-local}@db:5432/nutriledger
+      JWT_SECRET: ${JWT_SECRET:-development-secret-replace-before-deploying}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-60}
+      CORS_ORIGINS: http://localhost:5173,http://localhost:8080
+      DEMO_MODE: ${DEMO_MODE:-true}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: http://localhost:8000/api
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
