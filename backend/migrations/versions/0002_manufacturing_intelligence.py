@@ -15,7 +15,11 @@ def _columns(table):
 
 def _add_column(table, column):
     if column.name not in _columns(table):
-        op.add_column(table, column)
+        if op.get_bind().dialect.name == "sqlite" and column.foreign_keys:
+            with op.batch_alter_table(table) as batch_op:
+                batch_op.add_column(column)
+        else:
+            op.add_column(table, column)
 
 
 def upgrade():
