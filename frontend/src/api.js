@@ -3,7 +3,8 @@ import axios from "axios";
 let csrfToken = "";
 
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || "http://localhost:8000/api",
+  baseURL: import.meta.env.VITE_API_URL
+    || (import.meta.env.VITE_API_HOST ? `https://${import.meta.env.VITE_API_HOST}/api` : "/api"),
   withCredentials: true,
 });
 

@@ -54,6 +54,12 @@ DESIGN.md              Architecture and business calculation notes
 
 ## Run locally
 
+### Deploy the full app on Render
+
+The GitHub repository includes a Render Blueprint for the API, static frontend and PostgreSQL database. Use the [Render deployment setup](https://render.com/deploy?repo=https://github.com/rithika5656/Order-to-Audit-System), connect your GitHub account, and provide `INITIAL_OWNER_EMAIL` and a strong `INITIAL_OWNER_PASSWORD` when prompted. These values are used only to create the first Owner account and are not stored in the repository. The frontend and API are deployed together through the Blueprint, with HTTPS cookies and a generated JWT secret.
+
+Render assigns the public application URL after the first deployment completes. The live URL cannot be listed until that service has been created in an authorized Render account. Free Render services may sleep when idle and free database availability/retention is subject to Render's current plan limits; use an appropriate paid plan for persistent production operation.
+
 ### Docker Compose (PostgreSQL)
 
 1. Copy `.env.example` to `.env`. Use a unique `JWT_SECRET` and a strong local database password.

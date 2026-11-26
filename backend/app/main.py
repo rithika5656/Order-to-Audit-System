@@ -50,6 +50,7 @@ origins = os.getenv(
     "http://localhost:5173,http://localhost:8080,http://127.0.0.1:8080",
 )
 origins = [origin.strip() for origin in origins.split(",") if origin.strip()]
+origins = [origin if "://" in origin else f"https://{origin}" for origin in origins]
 app.add_middleware(
     CORSMiddleware, allow_origins=origins, allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
