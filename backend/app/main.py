@@ -1,6 +1,7 @@
 import os
 import csv
-from datetime import date, datetime
+from collections import defaultdict
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO, StringIO
 
@@ -12,13 +13,20 @@ from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
 from .models import (
-    AuditLog, BomItem, Customer, Dispatch, Expense, InventoryMovement, Invoice,
-    Order, Payment, Product, ProductionConsumption, ProductionRun, Purchase,
-    RawMaterial, Supplier, User,
+    AuditLog, BomItem, CompanyProfile, Customer, Dispatch, Expense, InventoryLot,
+    InventoryLotAllocation, InventoryMovement, Invoice, Order, Payment, Product,
+    ProductionConsumption, ProductionRun, Purchase, RawMaterial, Supplier,
+    SupplierMaterial, User,
 )
-from .schemas import LoginRequest, OrderRequest, PaymentRequest, ProductionRequest, PurchaseRequest
+from .schemas import (
+    LoginRequest, OrderRequest, PaymentRequest, ProductionRequest, PurchaseRequest,
+    ReorderPolicyRequest,
+)
 from .security import create_token, current_user, hash_password, require_roles, verify_password
-from .services import add_movement, available_for_order, balance, bom_expected, build_invoice, dispatched, money, outstanding
+from .services import (
+    add_movement, available_for_order, balance, bom_expected, build_invoice, create_lot,
+    dispatched, lot_balance, lot_summary, money, outstanding, stock_intelligence,
+)
 
 
 app = FastAPI(title="NutriLedger API", version="1.0.0")
@@ -67,18 +75,109 @@ def me(user: User = Depends(current_user)):
 
 
 @app.get("/api/dashboard")
-def dashboard(db: Session = Depends(get_db), user: User = Depends(current_user)):
+def dashboard(
+    from_date: date | None = None,
+    to_date: date | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     today = date.today()
+    chart_start = from_date or today - timedelta(days=29)
+    chart_end = to_date or today
+    if chart_start > chart_end:
+        raise HTTPException(status_code=422, detail="Start date must be on or before end date")
+    if (chart_end - chart_start).days > 365:
+        raise HTTPException(status_code=422, detail="Dashboard date range cannot exceed 366 days")
     today_orders = db.scalar(select(func.count(Order.id)).where(func.date(Order.created_at) == today.isoformat())) or 0
     pending = db.scalar(select(func.count(Order.id)).where(Order.status == "Submitted")) or 0
     products = list(db.scalars(select(Product).where(Product.active.is_(True))))
-    finished = [{"product": p.name, "quantity": str(balance(db, "finished", p.id)), "unit": p.unit} for p in products]
+    finished = []
+    stock_alerts = []
+    for product in products:
+        product_stock = stock_intelligence(db, "finished", product)
+        finished.append({
+            "id": product.id, "product": product.name, "quantity": product_stock["quantity"],
+            "available_quantity": product_stock["available_quantity"],
+            "unit": product.unit, "low": product_stock["low_stock"],
+            "reorder_level": product_stock["minimum_stock"],
+            "estimated_days_remaining": product_stock["estimated_days_remaining"],
+        })
+        if product_stock["low_stock"]:
+            stock_alerts.append({
+                "type": "low_stock", "severity": "warning",
+                "title": f"Low finished stock: {product.name}",
+                "detail": f"{product_stock['available_quantity']} usable of {product_stock['quantity']} {product.unit} on hand; minimum is {product_stock['minimum_stock']}.",
+                "href": "/inventory",
+            })
     materials = list(db.scalars(select(RawMaterial)))
-    raw_stock = [{"material": m.name, "quantity": str(balance(db, "material", m.id)), "unit": m.unit,
-                  "low": balance(db, "material", m.id) <= m.reorder_level} for m in materials]
+    raw_stock = []
+    for material in materials:
+        material_stock = stock_intelligence(db, "material", material)
+        raw_stock.append({
+            "id": material.id, "material": material.name, "quantity": material_stock["quantity"],
+            "available_quantity": material_stock["available_quantity"],
+            "unit": material.unit, "low": material_stock["low_stock"],
+            "reorder_level": material_stock["minimum_stock"],
+            "estimated_days_remaining": material_stock["estimated_days_remaining"],
+            "suggested_reorder_quantity": material_stock["suggested_reorder_quantity"],
+        })
+        if material_stock["low_stock"]:
+            remaining = material_stock["estimated_days_remaining"]
+            detail = f"{material_stock['available_quantity']} usable of {material_stock['quantity']} {material.unit} on hand; minimum is {material_stock['minimum_stock']}."
+            if remaining is not None:
+                detail += f" Estimated coverage: {remaining} days."
+            stock_alerts.append({
+                "type": "low_stock", "severity": "warning",
+                "title": f"Low raw material: {material.name}",
+                "detail": detail, "href": "/inventory",
+            })
     invoices = list(db.scalars(select(Invoice)))
     sales = sum((i.taxable for i in invoices), Decimal("0"))
     open_receivables = sum((outstanding(db, invoice.id) for invoice in invoices), Decimal("0"))
+    total_orders = db.scalar(select(func.count(Order.id))) or 0
+    completed_runs = list(db.scalars(
+        select(ProductionRun).where(ProductionRun.status == "Completed")
+    ))
+    expected_output_total = sum((run.expected_output for run in completed_runs), 0)
+    good_output_total = sum((run.good_output for run in completed_runs), 0)
+    production_efficiency = (
+        Decimal(good_output_total) / Decimal(expected_output_total) * Decimal("100")
+        if expected_output_total else Decimal("0")
+    )
+    run_costs = defaultdict(lambda: Decimal("0"))
+    run_outputs = defaultdict(lambda: Decimal("0"))
+    for run in completed_runs:
+        consumptions = list(db.scalars(select(ProductionConsumption).where(
+            ProductionConsumption.production_run_id == run.id,
+        )))
+        direct_cost = sum((row.quantity * row.unit_cost for row in consumptions), Decimal("0"))
+        overhead = db.scalar(select(func.coalesce(func.sum(Expense.amount), 0)).where(
+            Expense.production_run_id == run.id,
+        ))
+        run_costs[run.product_id] += direct_cost + Decimal(overhead)
+        run_outputs[run.product_id] += Decimal(run.good_output)
+    raw_inventory_value = sum(
+        (balance(db, "material", material.id) * material.weighted_average_cost for material in materials),
+        Decimal("0"),
+    )
+    products_for_valuation = list(db.scalars(select(Product)))
+    bom_rows = list(db.scalars(select(BomItem)))
+    material_costs = {material.id: material.weighted_average_cost for material in materials}
+    standard_costs = defaultdict(lambda: Decimal("0"))
+    for bom in bom_rows:
+        if bom.per_output:
+            standard_costs[bom.product_id] += (
+                bom.quantity / bom.per_output * material_costs.get(bom.material_id, Decimal("0"))
+            )
+    finished_inventory_value = Decimal("0")
+    for product in products_for_valuation:
+        unit_cost = (
+            run_costs[product.id] / run_outputs[product.id]
+            if run_outputs[product.id]
+            else standard_costs[product.id]
+        )
+        finished_inventory_value += balance(db, "finished", product.id) * unit_cost
+    inventory_value = money(raw_inventory_value + finished_inventory_value)
     month = date(today.year, today.month, 1)
     months = []
     for offset in range(5, -1, -1):
@@ -87,9 +186,20 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(current_user))
         month_start = date(year, month_index + 1, 1)
         months.append(month_start)
     monthly_sales = []
+    monthly_production = []
+    monthly_payments = []
+    monthly_wastage = []
+    all_payments = list(db.scalars(select(Payment)))
+    runs_by_month = defaultdict(list)
+    for run in completed_runs:
+        runs_by_month[(run.created_at.year, run.created_at.month)].append(run)
+    payments_by_month = defaultdict(lambda: Decimal("0"))
+    for payment in all_payments:
+        payments_by_month[(payment.created_at.year, payment.created_at.month)] += payment.amount
     for month_start in months:
         next_month = date(month_start.year + (1 if month_start.month == 12 else 0),
                           1 if month_start.month == 12 else month_start.month + 1, 1)
+        month_runs = runs_by_month[(month_start.year, month_start.month)]
         monthly_sales.append({
             "month": month_start.strftime("%b %y"),
             "sales": str(money(sum((
@@ -97,19 +207,216 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(current_user))
                 if month_start <= invoice.created_at.date() < next_month
             ), Decimal("0")))),
         })
+        monthly_production.append({
+            "month": month_start.strftime("%b %y"),
+            "expected": sum(run.expected_output for run in month_runs),
+            "actual": sum(run.good_output for run in month_runs),
+        })
+        monthly_wastage.append({
+            "month": month_start.strftime("%b %y"),
+            "damaged": sum(run.damaged for run in month_runs),
+            "yield_shortfall": sum(max(0, run.expected_output - run.good_output) for run in month_runs),
+        })
+        monthly_payments.append({
+            "month": month_start.strftime("%b %y"),
+            "collected": str(money(payments_by_month[(month_start.year, month_start.month)])),
+        })
+    product_sales_rows = db.execute(
+        select(
+            Product.id, Product.name, func.coalesce(func.sum(Order.quantity), 0),
+            func.coalesce(func.sum(Invoice.taxable), 0),
+        )
+        .join(Order, Order.product_id == Product.id)
+        .join(Invoice, Invoice.order_id == Order.id)
+        .group_by(Product.id, Product.name)
+        .order_by(func.sum(Order.quantity).desc(), Product.name)
+        .limit(5)
+    ).all()
+    top_selling_products = [{
+        "product_id": product_id, "product": name,
+        "units_sold": int(quantity), "revenue": str(money(Decimal(revenue))),
+    } for product_id, name, quantity, revenue in product_sales_rows]
+    top_customer_rows = db.execute(
+        select(
+            Customer.id, Customer.name, func.count(Invoice.id),
+            func.coalesce(func.sum(Invoice.taxable), 0),
+        )
+        .join(Order, Order.customer_id == Customer.id)
+        .join(Invoice, Invoice.order_id == Order.id)
+        .group_by(Customer.id, Customer.name)
+        .order_by(func.sum(Invoice.taxable).desc(), Customer.name)
+        .limit(5)
+    ).all()
+    top_customers = [{
+        "customer_id": customer_id, "customer": name,
+        "invoices": int(invoice_count), "revenue": str(money(Decimal(revenue))),
+    } for customer_id, name, invoice_count, revenue in top_customer_rows]
+    pending_customer_payments = []
+    for invoice in sorted(
+        (item for item in invoices if outstanding(db, item.id) > 0),
+        key=lambda item: outstanding(db, item.id), reverse=True,
+    )[:6]:
+        pending_customer_payments.append({
+            "invoice": invoice.number, "customer": invoice.order.customer.name,
+            "amount_due": str(money(outstanding(db, invoice.id))),
+            "created_at": invoice.created_at.isoformat(),
+        })
     recent = list(db.scalars(select(Order).order_by(Order.created_at.desc()).limit(6)))
     month_start = datetime(today.year, today.month, 1)
-    runs_this_month = list(db.scalars(select(ProductionRun).where(ProductionRun.created_at >= month_start)))
+    runs_this_month = list(db.scalars(select(ProductionRun).where(
+        ProductionRun.created_at >= month_start, ProductionRun.status == "Completed",
+    )))
+    active_runs = db.scalar(select(func.count(ProductionRun.id)).where(
+        ProductionRun.status.in_(("Planned", "In Progress")),
+    )) or 0
+    today_dispatches = db.scalar(select(func.count(Dispatch.id)).where(
+        func.date(Dispatch.created_at) == today.isoformat(),
+    )) or 0
+    today_payments = sum((
+        payment.amount for payment in all_payments
+        if payment.created_at.date() == today
+    ), Decimal("0"))
+    pending_dispatches = []
+    for invoice in invoices:
+        remaining = invoice.order.quantity - dispatched(db, invoice.id)
+        if remaining > 0:
+            pending_dispatches.append({
+                "invoice": invoice.number, "order": invoice.order.reference,
+                "customer": invoice.order.customer.name, "remaining": remaining,
+            })
+    revenue_rows = db.execute(
+        select(func.date(Invoice.created_at), func.sum(Invoice.taxable))
+        .where(
+            Invoice.created_at >= datetime.combine(chart_start, datetime.min.time()),
+            Invoice.created_at < datetime.combine(chart_end + timedelta(days=1), datetime.min.time()),
+        )
+        .group_by(func.date(Invoice.created_at))
+        .order_by(func.date(Invoice.created_at))
+    ).all()
+    revenue_by_day = {str(day): Decimal(value) for day, value in revenue_rows}
+    revenue_series = []
+    for offset in range((chart_end - chart_start).days + 1):
+        current_date = chart_start + timedelta(days=offset)
+        revenue_series.append({
+            "date": current_date.isoformat(),
+            "revenue": str(money(revenue_by_day.get(current_date.isoformat(), Decimal("0")))),
+        })
+    recent_batches = list(db.scalars(
+        select(ProductionRun).order_by(ProductionRun.created_at.desc()).limit(6)
+    ))
+    production_runs = list(db.scalars(
+        select(ProductionRun).where(ProductionRun.status == "Completed")
+        .order_by(ProductionRun.created_at.desc()).limit(8)
+    ))
+    production_performance = [{
+        "reference": run.reference, "date": run.created_at.date().isoformat(),
+        "expected": run.expected_output, "actual": run.good_output,
+    } for run in reversed(production_runs)]
+    attention = list(stock_alerts)
+    if pending:
+        attention.append({
+            "type": "pending_orders", "severity": "information",
+            "title": f"{pending} order{'s' if pending != 1 else ''} awaiting verification",
+            "detail": "Review submitted orders before invoicing.",
+            "href": "/orders",
+        })
+    if pending_dispatches:
+        attention.append({
+            "type": "pending_dispatch", "severity": "information",
+            "title": f"{len(pending_dispatches)} invoice{'s' if len(pending_dispatches) != 1 else ''} awaiting dispatch",
+            "detail": f"{sum(row['remaining'] for row in pending_dispatches)} units remain to be dispatched.",
+            "href": "/invoices",
+        })
+    for invoice in sorted(
+        (invoice for invoice in invoices if outstanding(db, invoice.id) > 0),
+        key=lambda item: item.created_at,
+    )[:3]:
+        due = outstanding(db, invoice.id)
+        attention.append({
+            "type": "receivable", "severity": "warning",
+            "title": f"Payment pending: {invoice.order.customer.name}",
+            "detail": f"{invoice.number} has {money(due)} outstanding.",
+            "href": "/invoices",
+        })
+    expiring_before = today + timedelta(days=30)
+    lots = db.scalars(select(InventoryLot).where(
+        InventoryLot.expiry_date.is_not(None),
+        InventoryLot.expiry_date <= expiring_before,
+    ))
+    for lot in lots:
+        quantity = lot_balance(db, lot.id)
+        if quantity <= 0:
+            continue
+        item = db.get(RawMaterial if lot.item_type == "material" else Product, lot.item_id)
+        item_name = item.name if item else f"{lot.item_type} #{lot.item_id}"
+        is_expired = lot.expiry_date < today
+        attention.append({
+            "type": "expiry", "severity": "critical" if is_expired else "warning",
+            "title": f"{'Expired' if is_expired else 'Expiring soon'} batch: {lot.batch_code}",
+            "detail": f"{item_name} · {quantity} on hand · expiry {lot.expiry_date.isoformat()}.",
+            "href": "/inventory",
+        })
+    raw_stock_alert_count = sum(1 for item in raw_stock if item["low"])
+    activities = list(db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(8)))
+    company_profile = db.scalar(select(CompanyProfile).order_by(CompanyProfile.id).limit(1))
     return {
         "today_orders": today_orders, "pending_orders": pending,
+        "total_orders": total_orders,
         "total_sales": str(money(sales)), "finished_goods": finished,
         "raw_materials": raw_stock,
         "outstanding_receivables": str(money(open_receivables)),
+        "inventory_valuation": str(inventory_value),
+        "raw_material_inventory_valuation": str(money(raw_inventory_value)),
+        "finished_goods_inventory_valuation": str(money(finished_inventory_value)),
+        "production_output": good_output_total,
+        "production_efficiency_percent": str(production_efficiency.quantize(Decimal("0.1"))),
+        "active_production_runs": active_runs,
+        "pending_dispatch_count": len(pending_dispatches),
+        "raw_material_alert_count": raw_stock_alert_count,
+        "pending_dispatches": pending_dispatches,
         "production_this_month": {
             "runs": len(runs_this_month),
             "good_output": sum(run.good_output for run in runs_this_month),
         },
+        "today_operations": {
+            "orders_received": today_orders,
+            "production_batches": sum(1 for run in completed_runs if run.created_at.date() == today),
+            "units_produced": sum(run.good_output for run in completed_runs if run.created_at.date() == today),
+            "dispatches": today_dispatches,
+            "payments_collected": str(money(today_payments)),
+        },
         "monthly_sales": monthly_sales,
+        "monthly_production": monthly_production,
+        "monthly_payments": monthly_payments,
+        "monthly_wastage": monthly_wastage,
+        "top_selling_products": top_selling_products,
+        "top_customers": top_customers,
+        "pending_customer_payments": pending_customer_payments,
+        "recent_production_batches": [{
+            "id": run.id, "reference": run.reference,
+            "product": db.get(Product, run.product_id).name,
+            "expected_output": run.expected_output, "good_output": run.good_output,
+            "damaged": run.damaged, "yield_variance_percent": str(run.yield_variance),
+            "status": run.status, "created_at": run.created_at.isoformat(),
+        } for run in recent_batches],
+        "revenue_analytics": {
+            "from_date": chart_start.isoformat(), "to_date": chart_end.isoformat(),
+            "series": revenue_series,
+        },
+        "production_performance": production_performance,
+        "stock_alerts": stock_alerts,
+        "attention": attention,
+        "recent_activities": [{
+            "id": row.id, "action": row.action, "entity": row.entity,
+            "entity_id": row.entity_id,
+            "user": db.get(User, row.user_id).name if row.user_id and db.get(User, row.user_id) else "System",
+            "created_at": row.created_at.isoformat(),
+        } for row in activities],
+        "company": ({
+            "name": company_profile.name, "city": company_profile.city,
+            "state": company_profile.state, "business": company_profile.business,
+            "demo_data": company_profile.demo_data,
+        } if company_profile else None),
         "recent_orders": [{"reference": o.reference, "customer": o.customer.name,
                            "product": o.product.name, "quantity": o.quantity,
                            "status": o.status, "created_at": o.created_at.isoformat()} for o in recent],
@@ -121,6 +428,7 @@ def products(db: Session = Depends(get_db), user: User = Depends(current_user)):
     return [{"id": p.id, "name": p.name, "sku": p.sku, "category": p.category,
              "pack_size": p.pack_size, "unit": p.unit, "selling_price": str(p.selling_price),
              "gst_rate": str(p.gst_rate), "hsn_code": p.hsn_code, "active": p.active,
+             "reorder_level": str(p.reorder_level),
              "stock": str(balance(db, "finished", p.id))}
             for p in db.scalars(select(Product).order_by(Product.name))]
 
@@ -151,9 +459,54 @@ def create_product(payload: dict, db: Session = Depends(get_db), user: User = De
 
 @app.get("/api/customers")
 def customers(db: Session = Depends(get_db), user: User = Depends(current_user)):
-    return [{"id": c.id, "name": c.name, "customer_type": c.customer_type,
-             "state": c.state, "gstin": c.gstin, "contact": c.contact}
-            for c in db.scalars(select(Customer).order_by(Customer.name))]
+    result = []
+    for customer in db.scalars(select(Customer).order_by(Customer.name)).all():
+        customer_invoices = list(db.scalars(
+            select(Invoice).join(Order, Invoice.order_id == Order.id)
+            .where(Order.customer_id == customer.id)
+        ))
+        due = sum((outstanding(db, invoice.id) for invoice in customer_invoices), Decimal("0"))
+        result.append({
+            "id": customer.id, "name": customer.name,
+            "customer_type": customer.customer_type, "state": customer.state,
+            "gstin": customer.gstin, "contact": customer.contact,
+            "billing_address": customer.billing_address,
+            "credit_limit": str(customer.credit_limit),
+            "outstanding_balance": str(money(due)),
+        })
+    return result
+
+
+@app.get("/api/suppliers")
+def suppliers(db: Session = Depends(get_db), user: User = Depends(require_roles(*FINANCE))):
+    result = []
+    for supplier in db.scalars(select(Supplier).order_by(Supplier.name)).all():
+        supplied = list(db.scalars(
+            select(RawMaterial.name)
+            .join(SupplierMaterial, SupplierMaterial.material_id == RawMaterial.id)
+            .where(SupplierMaterial.supplier_id == supplier.id)
+            .order_by(RawMaterial.name)
+        ))
+        result.append({
+            "id": supplier.id, "name": supplier.name,
+            "contact": supplier.contact, "gstin": supplier.gstin,
+            "payment_terms": supplier.payment_terms,
+            "materials": supplied,
+        })
+    return result
+
+
+@app.get("/api/company")
+def company(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    profile = db.scalar(select(CompanyProfile).order_by(CompanyProfile.id).limit(1))
+    if profile is None:
+        return None
+    return {
+        "name": profile.name, "address": profile.address,
+        "city": profile.city, "state": profile.state,
+        "country": profile.country, "business": profile.business,
+        "demo_data": profile.demo_data,
+    }
 
 
 @app.post("/api/customers")
@@ -178,21 +531,64 @@ def inventory(db: Session = Depends(get_db), user: User = Depends(current_user))
     materials = list(db.scalars(select(RawMaterial).order_by(RawMaterial.name)))
     products = list(db.scalars(select(Product).order_by(Product.name)))
     return {
-        "materials": [{"id": m.id, "name": m.name, "unit": m.unit,
-                       "quantity": str(balance(db, "material", m.id)),
-                       "reorder_level": str(m.reorder_level),
-                       "weighted_average_cost": str(m.weighted_average_cost)} for m in materials],
-        "finished_goods": [{"id": p.id, "name": p.name, "unit": p.unit,
-                            "quantity": str(balance(db, "finished", p.id))} for p in products],
+        "materials": [{
+            **stock_intelligence(db, "material", material),
+            "weighted_average_cost": str(material.weighted_average_cost),
+            "lots": lot_summary(db, "material", material.id),
+        } for material in materials],
+        "finished_goods": [{
+            **stock_intelligence(db, "finished", product),
+            "lots": lot_summary(db, "finished", product.id),
+        } for product in products],
     }
+
+
+@app.put("/api/inventory/{item_type}/{item_id}/policy")
+def update_reorder_policy(
+    item_type: str,
+    item_id: int,
+    payload: ReorderPolicyRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*ADMIN)),
+):
+    model = RawMaterial if item_type == "material" else Product if item_type == "finished" else None
+    if model is None:
+        raise HTTPException(status_code=422, detail="Inventory type must be material or finished")
+    item = db.get(model, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Inventory item not found")
+    item.reorder_level = payload.minimum_stock
+    item.reorder_days = payload.target_coverage_days
+    audit(db, user, "updated reorder policy", item_type, str(item_id))
+    db.commit()
+    return stock_intelligence(db, item_type, item)
 
 
 @app.get("/api/inventory/ledger")
 def ledger(db: Session = Depends(get_db), user: User = Depends(current_user)):
-    rows = db.scalars(select(InventoryMovement).order_by(InventoryMovement.created_at.desc()).limit(500))
-    return [{"id": r.id, "item_type": r.item_type, "item_id": r.item_id,
-             "quantity": str(r.quantity), "unit": r.unit, "source_type": r.source_type,
-             "source_id": r.source_id, "created_at": r.created_at.isoformat()} for r in rows]
+    rows = list(db.scalars(
+        select(InventoryMovement).order_by(InventoryMovement.created_at.desc()).limit(500)
+    ))
+    result = []
+    for row in rows:
+        lot = db.get(InventoryLot, row.lot_id) if row.lot_id else None
+        allocations = db.execute(
+            select(InventoryLotAllocation.quantity, InventoryLot.batch_code)
+            .join(InventoryLot, InventoryLot.id == InventoryLotAllocation.lot_id)
+            .where(InventoryLotAllocation.movement_id == row.id)
+        ).all()
+        result.append({
+            "id": row.id, "item_type": row.item_type, "item_id": row.item_id,
+            "quantity": str(row.quantity), "unit": row.unit, "source_type": row.source_type,
+            "source_id": row.source_id, "lot_id": row.lot_id,
+            "batch_code": lot.batch_code if lot else None,
+            "expiry_date": lot.expiry_date.isoformat() if lot and lot.expiry_date else None,
+            "allocations": [{
+                "batch_code": batch_code, "quantity": str(quantity),
+            } for quantity, batch_code in allocations],
+            "created_at": row.created_at.isoformat(),
+        })
+    return result
 
 
 @app.post("/api/purchases")
@@ -202,6 +598,8 @@ def create_purchase(payload: PurchaseRequest, db: Session = Depends(get_db), use
         raise HTTPException(status_code=404, detail="Raw material not found")
     if db.scalar(select(Purchase).where(Purchase.reference == payload.reference)):
         raise HTTPException(status_code=409, detail="Purchase reference already processed")
+    if payload.expiry_date and not payload.batch_code:
+        raise HTTPException(status_code=422, detail="A batch code is required when an expiry date is provided")
     purchase = Purchase(
         reference=payload.reference, material_id=material.id,
         quantity=payload.quantity, unit_rate=payload.unit_rate,
@@ -216,7 +614,13 @@ def create_purchase(payload: PurchaseRequest, db: Session = Depends(get_db), use
     )
     db.add(purchase)
     db.flush()
-    add_movement(db, "material", material.id, payload.quantity, material.unit, "purchase", purchase.reference)
+    lot = create_lot(
+        db, "material", material.id, payload.batch_code, payload.expiry_date,
+    ) if payload.batch_code else None
+    add_movement(
+        db, "material", material.id, payload.quantity, material.unit,
+        "purchase", purchase.reference, lot_id=lot.id if lot else None,
+    )
     audit(db, user, "recorded", "purchase", purchase.reference)
     db.commit()
     return {"id": purchase.id, "reference": purchase.reference, "total": str(purchase.total)}
@@ -274,7 +678,13 @@ def create_production(payload: ProductionRequest, db: Session = Depends(get_db),
                     production_run_id=run.id, material_id=pouch.id,
                     quantity=Decimal(payload.damaged), unit_cost=pouch.weighted_average_cost,
                 ))
-    add_movement(db, "finished", product.id, Decimal(payload.good_output), product.unit, "production", run.reference)
+    finished_lot = create_lot(
+        db, "finished", product.id, run.reference, payload.finished_expiry_date,
+    )
+    add_movement(
+        db, "finished", product.id, Decimal(payload.good_output), product.unit,
+        "production", run.reference, lot_id=finished_lot.id,
+    )
     audit(db, user, "completed", "production_run", run.reference)
     db.commit()
     return {
@@ -423,11 +833,62 @@ def list_orders(db: Session = Depends(get_db), user: User = Depends(current_user
     query = select(Order).order_by(Order.created_at.desc())
     if user.role == "Salesman":
         query = query.where(Order.created_by == user.id)
-    return [{"id": o.id, "reference": o.reference, "customer": o.customer.name,
-             "state": o.customer.state, "product": o.product.name, "product_id": o.product_id,
-             "customer_id": o.customer_id, "quantity": o.quantity, "unit_price": str(o.unit_price),
-             "available_stock": str(available_for_order(db, o.product_id)),
-             "status": o.status, "created_at": o.created_at.isoformat()} for o in db.scalars(query)]
+    result = []
+    for order in db.scalars(query).all():
+        invoice = db.scalar(select(Invoice).where(Invoice.order_id == order.id))
+        invoice_due = outstanding(db, invoice.id) if invoice else Decimal("0")
+        shipped = dispatched(db, invoice.id) if invoice else 0
+        if invoice is None:
+            fulfillment_stage = "Awaiting verification" if order.status == "Submitted" else order.status
+            payment_status = "Not invoiced"
+            invoice_total = None
+            invoice_number = None
+            pending_action = (
+                "Review order" if order.status == "Submitted"
+                else "Generate invoice" if order.status == "Approved"
+                else "No action" if order.status == "Rejected"
+                else "Review order"
+            )
+        else:
+            fulfillment_stage = (
+                "Completed" if shipped >= order.quantity and order.status == "Completed"
+                else "Dispatched" if shipped >= order.quantity
+                else "Partially dispatched" if shipped
+                else "Ready for dispatch"
+            )
+            payment_status = (
+                "Paid" if invoice_due <= 0
+                else "Partially paid" if invoice_due < invoice.total
+                else "Unpaid"
+            )
+            invoice_total = str(invoice.total)
+            invoice_number = invoice.number
+            pending_action = (
+                "Dispatch remaining units" if shipped < order.quantity
+                else "Collect payment" if invoice_due > 0
+                else "Complete"
+            )
+        result.append({
+            "id": order.id, "reference": order.reference,
+            "customer": order.customer.name, "state": order.customer.state,
+            "product": order.product.name, "product_id": order.product_id,
+            "customer_id": order.customer_id, "quantity": order.quantity,
+            "unit_price": str(order.unit_price),
+            "available_stock": str(available_for_order(db, order.product_id)),
+            "status": order.status, "fulfillment_stage": fulfillment_stage,
+            "approval_status": (
+                "Pending approval" if order.status == "Submitted"
+                else "Rejected" if order.status == "Rejected"
+                else "Approved"
+            ),
+            "payment_status": payment_status, "invoice_number": invoice_number,
+            "invoice_total": invoice_total, "amount_due": str(money(invoice_due)),
+            "pending_action": pending_action,
+            "dispatched_quantity": shipped,
+            "remaining_quantity": max(0, order.quantity - shipped),
+            "created_at": order.created_at.isoformat(),
+        })
+    return result
 
 
 @app.post("/api/orders/{order_id}/approve")

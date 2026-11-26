@@ -1,7 +1,7 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -32,6 +32,7 @@ class Customer(Base):
     gstin: Mapped[str | None] = mapped_column(String(20), nullable=True)
     contact: Mapped[str | None] = mapped_column(String(80), nullable=True)
     billing_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    credit_limit: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0"))
 
 
 class Product(Base):
@@ -45,6 +46,8 @@ class Product(Base):
     selling_price: Mapped[Decimal] = mapped_column(Numeric(12, 2))
     gst_rate: Mapped[Decimal] = mapped_column(Numeric(5, 2), default=Decimal("5.00"))
     hsn_code: Mapped[str] = mapped_column(String(24), default="210690")
+    reorder_level: Mapped[Decimal] = mapped_column(Numeric(14, 3), default=Decimal("0"))
+    reorder_days: Mapped[int] = mapped_column(Integer, default=14)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
@@ -54,6 +57,7 @@ class RawMaterial(Base):
     name: Mapped[str] = mapped_column(String(160), unique=True)
     unit: Mapped[str] = mapped_column(String(24))
     reorder_level: Mapped[Decimal] = mapped_column(Numeric(14, 3), default=Decimal("0"))
+    reorder_days: Mapped[int] = mapped_column(Integer, default=14)
     weighted_average_cost: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
 
 
@@ -62,6 +66,16 @@ class Supplier(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(160), unique=True)
     contact: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    gstin: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    payment_terms: Mapped[str] = mapped_column(String(80), default="Due on receipt")
+
+
+class SupplierMaterial(Base):
+    __tablename__ = "supplier_materials"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"), index=True)
+    material_id: Mapped[int] = mapped_column(ForeignKey("raw_materials.id"), index=True)
+    __table_args__ = (UniqueConstraint("supplier_id", "material_id"),)
 
 
 class BomItem(Base):
@@ -154,6 +168,7 @@ class ProductionRun(Base):
     good_output: Mapped[int] = mapped_column(Integer)
     damaged: Mapped[int] = mapped_column(Integer, default=0)
     yield_variance: Mapped[Decimal] = mapped_column(Numeric(8, 3))
+    status: Mapped[str] = mapped_column(String(24), default="Completed", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -162,9 +177,21 @@ class ProductionConsumption(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     production_run_id: Mapped[int] = mapped_column(ForeignKey("production_runs.id"), index=True)
     material_id: Mapped[int] = mapped_column(ForeignKey("raw_materials.id"))
+    expected_quantity: Mapped[Decimal] = mapped_column(Numeric(14, 3), default=Decimal("0"))
     quantity: Mapped[Decimal] = mapped_column(Numeric(14, 3))
     unit_cost: Mapped[Decimal] = mapped_column(Numeric(14, 4))
     __table_args__ = (UniqueConstraint("production_run_id", "material_id"),)
+
+
+class InventoryLot(Base):
+    __tablename__ = "inventory_lots"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    item_type: Mapped[str] = mapped_column(String(24), index=True)
+    item_id: Mapped[int] = mapped_column(Integer, index=True)
+    batch_code: Mapped[str] = mapped_column(String(80))
+    expiry_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("item_type", "item_id", "batch_code"),)
 
 
 class InventoryMovement(Base):
@@ -176,8 +203,18 @@ class InventoryMovement(Base):
     unit: Mapped[str] = mapped_column(String(24))
     source_type: Mapped[str] = mapped_column(String(32))
     source_id: Mapped[str] = mapped_column(String(60))
+    lot_id: Mapped[int | None] = mapped_column(ForeignKey("inventory_lots.id"), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     __table_args__ = (UniqueConstraint("source_type", "source_id", "item_type", "item_id"),)
+
+
+class InventoryLotAllocation(Base):
+    __tablename__ = "inventory_lot_allocations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    movement_id: Mapped[int] = mapped_column(ForeignKey("inventory_movements.id"), index=True)
+    lot_id: Mapped[int] = mapped_column(ForeignKey("inventory_lots.id"), index=True)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(14, 3))
+    __table_args__ = (UniqueConstraint("movement_id", "lot_id"),)
 
 
 class AuditLog(Base):
@@ -188,3 +225,25 @@ class AuditLog(Base):
     entity: Mapped[str] = mapped_column(String(60))
     entity_id: Mapped[str] = mapped_column(String(60))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class CompanyProfile(Base):
+    __tablename__ = "company_profiles"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(160), unique=True)
+    address: Mapped[str] = mapped_column(Text)
+    city: Mapped[str] = mapped_column(String(100))
+    state: Mapped[str] = mapped_column(String(80))
+    country: Mapped[str] = mapped_column(String(80), default="India")
+    business: Mapped[str] = mapped_column(String(240))
+    demo_data: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class DemoDataRecord(Base):
+    __tablename__ = "demo_data_records"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_key: Mapped[str] = mapped_column(String(80), index=True)
+    entity_type: Mapped[str] = mapped_column(String(80))
+    entity_id: Mapped[str] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("batch_key", "entity_type", "entity_id"),)

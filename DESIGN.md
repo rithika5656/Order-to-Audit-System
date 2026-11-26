@@ -15,7 +15,7 @@ The shared interface uses dark navy (`#101D38`) and midnight blue (`#172B4D`) fo
 - One invoice can have multiple dispatches and payments for partial fulfillment/settlement.
 - BOM items join a finished product to raw materials and provide required quantity per output quantity.
 - Purchases refer to a raw material; production runs refer to a product.
-- Each inventory movement stores an item type/id, signed quantity, unit and unique source type/id pair per item. Audit rows record actor, operation, entity and timestamp.
+- Each inventory movement stores an item type/id, signed quantity, unit, optional inventory-lot reference and unique source type/id pair per item. Lot allocations connect a single issue movement to one or more received/produced lots without changing the existing movement uniqueness rule. Audit rows record actor, operation, entity and timestamp.
 
 ## Inventory ledger
 
@@ -23,7 +23,7 @@ Balances are calculated as `SUM(inventory_movements.quantity)` grouped by item. 
 
 `Closing stock = opening balance + receipts - issues - dispatches + adjustments`
 
-Stock is never directly edited. Purchase, production and dispatch endpoints record source documents and reject movements that result in a negative balance. For high-concurrency deployment, inventory-changing operations should additionally use database-level serialization/locking or a materialized balance row with guarded updates; current request transactions provide atomic multi-row writes but not a full concurrent reservation system.
+Stock is never directly edited. Purchase, production and dispatch endpoints record source documents and reject movements that result in a negative balance. When lots are tracked, production issues and dispatches use earliest-expiry-first allocation, skip expired lots and then consume legacy/untracked balances. Batch receipts and issues remain signed ledger movements; lot-allocation rows only identify which batch supplied a posted issue. Inventory usage and coverage use the latest 30 days of production issues or dispatches. Reorder suggestions target the greater of minimum stock and average daily usage multiplied by configured target coverage days; where there is no usage history, a low item is suggested back to twice its minimum. For high-concurrency deployment, inventory-changing operations should additionally use database-level serialization/locking or a materialized balance row with guarded updates; current request transactions provide atomic multi-row writes but not a full concurrent reservation system.
 
 The benchmark treats pouches used for good output (188) as an actual production issue and damaged pouches (6) as a separate production-damage issue. Cartons are consumed as entered (9). Finished inventory increases only by good output, not expected output or damaged units.
 

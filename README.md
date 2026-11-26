@@ -8,15 +8,26 @@ NutriLedger connects sales orders, GST billing, purchasing, production and stock
 
 - JWT sign-in with salted PBKDF2 password hashes and role-gated API endpoints.
 - Admin, Salesman, Production Supervisor, Accountant / Auditor and Owner demo roles.
-- Live dashboard, product/customer directories and ledger-derived stock balances.
-- Purchase receipts with weighted-average raw-material cost updates.
+- Manufacturing command-center dashboard with filtered revenue analytics, production performance, stock alerts, dispatch/receivable priorities and recent audit activity.
+- Inventory intelligence with configurable reorder policies, historical usage/coverage estimates, reorder suggestions and batch/expiry visibility.
+- Product/customer directories and ledger-derived stock balances.
+- Purchase receipts with weighted-average raw-material cost updates and optional batch/expiry tracking.
 - BOM-driven production runs, actual-material issues, damaged pouch issues and yield/material variances.
 - Order submission with stock warning, approval checks, GST invoicing, partial dispatch and payments.
 - Invoice PDF download, GST/sales/production/receivables summaries and audit logs.
 - Responsive enterprise interface using a dark-navy and royal-blue design system.
 - PostgreSQL Docker Compose setup, Alembic migration entry point and automated benchmark tests.
+- Optional Sri Lakshmi Foods demo dataset with a separate, registry-limited reset command.
 
 The UI currently exposes the operational flows above, with report exports for sales, production, stock ledger and receivables.
+
+### Dashboard command center
+
+The Overview page uses the authenticated `/api/dashboard` response and database records for orders, production, invoices, stock movements, inventory lots and audit activity. Revenue analytics defaults to the latest 30 days and accepts `from_date` / `to_date` (`YYYY-MM-DD`) query parameters; ranges are limited to 366 days. The dashboard also compares expected and good production output for the latest completed runs and builds actionable attention items from current stock policies, pending order/dispatch work, unpaid invoices and near-expiry or expired lots.
+
+### Smart inventory intelligence
+
+The Inventory page derives on-hand balances from stock movements and shows 30-day average usage, estimated days remaining, suggested replenishment, reorder minimums and tracked lots. Admins can update a minimum-stock level and target coverage days; low-stock alerts are calculated from those policies and recent consumption. Purchase receipts may include a batch code and expiry date, and completed production creates a finished-goods batch using its run reference. Production issues and dispatches allocate from eligible lots by earliest expiry first; expired tracked quantities are excluded from issue/dispatch availability. Existing untracked opening balances remain ledger-compatible.
 
 ## Technology
 
@@ -30,7 +41,7 @@ The UI currently exposes the operational flows above, with report exports for sa
 ```text
 backend/
   app/                 API, SQLAlchemy models, auth and business services
-  migrations/          Alembic environment and initial schema migration
+  migrations/          Alembic environment and versioned schema migrations
   tests/               Arithmetic and end-to-end benchmark tests
   seed.py              Development-only benchmark seed
 frontend/
@@ -71,6 +82,30 @@ alembic upgrade head
 python seed.py
 uvicorn app.main:app --reload
 ```
+
+### Sri Lakshmi Foods demo data
+
+The benchmark fixture from `seed.py` remains independent. To add the Sri Lakshmi Foods demo company, first apply migrations and run its separate deterministic seeder:
+
+```powershell
+cd backend
+$env:DEMO_MODE = "true"
+alembic upgrade head
+python seed_demo.py
+```
+
+The script creates 10 products, 15 materials, 8 customers, 10 suppliers, 5 demo users, 10 recipes, 35 orders, 18 production batches, 12 purchases, 28 invoices, 15 payments, 200+ stock ledger movements and 30+ audit activities. Every generated business record is marked `DEMO DATA` or registered under a dedicated demo batch key. It refuses to overwrite an existing company profile and is idempotent for a seeded batch. Demo accounts use `SriLakshmiDemo2026!` by default; set `DEMO_SEED_PASSWORD` before seeding to choose another password. Their emails are `demo.admin@srilakshmifoods.example.test`, `demo.sales@srilakshmifoods.example.test`, `demo.production@srilakshmifoods.example.test`, `demo.accounts@srilakshmifoods.example.test` and `demo.owner@srilakshmifoods.example.test`.
+
+The dashboard, customer directory, supplier directory and order register read their values from database queries. Order approval/fulfilment and payment are shown as separate states, and stock balances continue to come from signed ledger movements.
+
+Reset is a separate, explicitly confirmed operation. It only targets rows registered by this demo seeder, requires `DEMO_MODE=true`, and stops if unregistered business, inventory or audit records depend on demo records:
+
+```powershell
+$env:DEMO_MODE = "true"
+python reset_demo.py --confirm
+```
+
+Do not run either demo command against a production database. The reset command never deletes shared role records or unregistered user/business records. The benchmark seed and its mandatory Murukku values are not changed by this demo data.
 
 Frontend (from `frontend`):
 

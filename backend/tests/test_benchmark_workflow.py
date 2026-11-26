@@ -1,3 +1,4 @@
+from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
@@ -157,10 +158,115 @@ def test_full_benchmark_workflow(client):
         "Carton": Decimal("21.000"),
     }
     assert goods == Decimal("88.000")
-    dashboard = client.get("/api/dashboard").json()
+    invoice_date = client.get("/api/invoices").json()[0]["created_at"][:10]
+    dashboard_response = client.get("/api/dashboard", params={
+        "from_date": invoice_date, "to_date": invoice_date,
+    })
+    assert dashboard_response.status_code == 200
+    dashboard = dashboard_response.json()
     assert dashboard["total_sales"] == "7500.00"
     assert dashboard["outstanding_receivables"] == "3875.00"
     assert dashboard["production_this_month"]["good_output"] == 188
+    assert dashboard["active_production_runs"] == 0
+    assert dashboard["pending_dispatch_count"] == 0
+    assert dashboard["revenue_analytics"]["series"] == [{
+        "date": invoice_date, "revenue": "7500.00",
+    }]
+    assert dashboard["production_performance"][0]["expected"] == 200
+    assert dashboard["production_performance"][0]["actual"] == 188
+    assert any(alert["type"] == "receivable" for alert in dashboard["attention"])
+
+
+def test_dashboard_rejects_invalid_date_ranges(client):
+    reversed_range = client.get("/api/dashboard", params={
+        "from_date": "2026-03-02", "to_date": "2026-03-01",
+    })
+    too_wide = client.get("/api/dashboard", params={
+        "from_date": "2024-01-01", "to_date": "2025-01-02",
+    })
+    assert reversed_range.status_code == 422
+    assert too_wide.status_code == 422
+
+
+def test_inventory_lots_policy_and_fefo_consumption(client):
+    ids = client.benchmark_ids
+    expiry = (date.today() + timedelta(days=45)).isoformat()
+    purchase = client.post("/api/purchases", json={
+        "material_id": ids["Flour"], "quantity": "5", "unit_rate": "45",
+        "reference": "PUR-LOT-TEST", "batch_code": "FLOUR-BATCH-01",
+        "expiry_date": expiry,
+    })
+    assert purchase.status_code == 200, purchase.text
+
+    inventory = client.get("/api/inventory").json()
+    flour = next(item for item in inventory["materials"] if item["id"] == ids["Flour"])
+    assert flour["quantity"] == "105.000"
+    assert flour["lots"][0]["batch_code"] == "FLOUR-BATCH-01"
+    assert flour["lots"][0]["quantity"] == "5.000"
+
+    policy = client.put(f"/api/inventory/material/{ids['Flour']}/policy", json={
+        "minimum_stock": "120", "target_coverage_days": 14,
+    })
+    assert policy.status_code == 200
+    assert policy.json()["low_stock"] is True
+
+    production = client.post("/api/production-runs", json={
+        "product_id": ids["product"], "expected_output": 200, "good_output": 200,
+        "reference": "RUN-LOT-TEST",
+        "actual_consumption": {
+            str(ids["Flour"]): "102", str(ids["Cooking oil"]): "1",
+            str(ids["Salt and spice mix"]): "0.1",
+            str(ids["200 g pouch"]): "2", str(ids["Carton"]): "0.1",
+        },
+    })
+    assert production.status_code == 200, production.text
+    issue = next(row for row in client.get("/api/inventory/ledger").json()
+                 if row["source_id"] == "RUN-LOT-TEST"
+                 and row["item_type"] == "material" and row["item_id"] == ids["Flour"])
+    assert issue["allocations"] == [{"batch_code": "FLOUR-BATCH-01", "quantity": "5.000"}], issue
+    flour_after_issue = next(
+        item for item in client.get("/api/inventory").json()["materials"]
+        if item["id"] == ids["Flour"]
+    )
+    assert flour_after_issue["quantity"] == "3.000"
+    assert flour_after_issue["lots"] == []
+
+    next_run = client.post("/api/production-runs", json={
+        "product_id": ids["product"], "expected_output": 200, "good_output": 200,
+        "reference": "RUN-LEGACY-STOCK-TEST",
+        "actual_consumption": {
+            str(ids["Flour"]): "3", str(ids["Cooking oil"]): "1",
+            str(ids["Salt and spice mix"]): "0.1",
+            str(ids["200 g pouch"]): "2", str(ids["Carton"]): "0.1",
+        },
+    })
+    assert next_run.status_code == 200, next_run.text
+
+
+def test_expired_lots_are_not_issueable_stock(client):
+    ids = client.benchmark_ids
+    purchase = client.post("/api/purchases", json={
+        "material_id": ids["Flour"], "quantity": "5", "unit_rate": "45",
+        "reference": "PUR-EXPIRED-TEST", "batch_code": "EXPIRED-FLOUR",
+        "expiry_date": (date.today() - timedelta(days=1)).isoformat(),
+    })
+    assert purchase.status_code == 200
+    flour = next(item for item in client.get("/api/inventory").json()["materials"]
+                 if item["id"] == ids["Flour"])
+    assert flour["quantity"] == "105.000"
+    assert flour["available_quantity"] == "100.000"
+    assert flour["lots"][0]["expired"] is True
+
+    failed_run = client.post("/api/production-runs", json={
+        "product_id": ids["product"], "expected_output": 200, "good_output": 200,
+        "reference": "RUN-EXPIRED-TEST",
+        "actual_consumption": {
+            str(ids["Flour"]): "101", str(ids["Cooking oil"]): "1",
+            str(ids["Salt and spice mix"]): "0.1",
+            str(ids["200 g pouch"]): "2", str(ids["Carton"]): "0.1",
+        },
+    })
+    assert failed_run.status_code == 409
 
 
 def test_role_restrictions_and_negative_inventory(client):
@@ -171,6 +277,11 @@ def test_role_restrictions_and_negative_inventory(client):
         "material_id": client.benchmark_ids["Flour"], "quantity": "1", "unit_rate": "1", "reference": "X",
     })
     assert forbidden.status_code == 403
+    forbidden_policy = client.put(
+        f"/api/inventory/material/{client.benchmark_ids['Flour']}/policy",
+        json={"minimum_stock": "25", "target_coverage_days": 14},
+    )
+    assert forbidden_policy.status_code == 403
     client.headers.update({"Authorization": f"Bearer {client.post('/api/auth/login', json={'email': 'admin@test.local', 'password': 'test-password'}).json()['access_token']}"})
     failed_run = client.post("/api/production-runs", json={
         "product_id": client.benchmark_ids["product"], "expected_output": 200,
