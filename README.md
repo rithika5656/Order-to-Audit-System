@@ -6,16 +6,18 @@ NutriLedger connects sales orders, GST billing, purchasing, production and stock
 
 ## Features implemented
 
-- JWT sign-in with salted PBKDF2 password hashes and role-gated API endpoints.
-- Admin, Salesman, Production Supervisor, Accountant / Auditor and Owner demo roles.
+- One common login with five database-assigned roles and role-specific dashboards.
+- Argon2id password hashing (legacy PBKDF2 hashes are upgraded at next login), expiring JWTs in HttpOnly cookies, CSRF protection, logout revocation and login throttling.
+- Owner, Factory Admin, Salesman, Production Supervisor and Accountant / Auditor permissions enforced by the API.
+- Password reset/change workflows and administrator user management with account activation and login history.
 - Manufacturing command-center dashboard with filtered revenue analytics, production performance, stock alerts, dispatch/receivable priorities and recent audit activity.
 - Inventory intelligence with configurable reorder policies, historical usage/coverage estimates, reorder suggestions and batch/expiry visibility.
-- Product/customer directories and ledger-derived stock balances.
+- Product/customer directories, assigned-customer sales scope and ledger-derived stock balances.
 - Purchase receipts with weighted-average raw-material cost updates and optional batch/expiry tracking.
 - BOM-driven production runs, actual-material issues, damaged pouch issues and yield/material variances.
 - Order submission with stock warning, approval checks, GST invoicing, partial dispatch and payments.
 - Invoice PDF download, GST/sales/production/receivables summaries and audit logs.
-- Responsive enterprise interface using a dark-navy and royal-blue design system.
+- Responsive enterprise interface using a dark-navy and royal-blue design system with separate Owner, Factory Admin, Sales, Production and Finance dashboards.
 - PostgreSQL Docker Compose setup, Alembic migration entry point and automated benchmark tests.
 - Optional Sri Lakshmi Foods demo dataset with a separate, registry-limited reset command.
 
@@ -61,6 +63,7 @@ DESIGN.md              Architecture and business calculation notes
    docker compose up --build -d
    docker compose exec api alembic -c alembic.ini upgrade head
    docker compose exec api python seed.py
+   docker compose exec api python seed_roles.py
    ```
 
 3. Open `http://localhost:8080`. API docs are at `http://localhost:8000/docs`.
@@ -80,6 +83,7 @@ $env:DATABASE_URL = "sqlite:///./nutriledger.db"
 $env:JWT_SECRET = "local-only-change-this-secret"
 alembic upgrade head
 python seed.py
+python seed_roles.py
 uvicorn app.main:app --reload
 ```
 
@@ -94,7 +98,29 @@ alembic upgrade head
 python seed_demo.py
 ```
 
-The script creates 10 products, 15 materials, 8 customers, 10 suppliers, 5 demo users, 10 recipes, 35 orders, 18 production batches, 12 purchases, 28 invoices, 15 payments, 200+ stock ledger movements and 30+ audit activities. Every generated business record is marked `DEMO DATA` or registered under a dedicated demo batch key. It refuses to overwrite an existing company profile and is idempotent for a seeded batch. Demo accounts use `SriLakshmiDemo2026!` by default; set `DEMO_SEED_PASSWORD` before seeding to choose another password. Their emails are `demo.admin@srilakshmifoods.example.test`, `demo.sales@srilakshmifoods.example.test`, `demo.production@srilakshmifoods.example.test`, `demo.accounts@srilakshmifoods.example.test` and `demo.owner@srilakshmifoods.example.test`.
+The script creates 10 products, 15 materials, 8 customers, 10 suppliers, 5 demo users, 10 recipes, 35 orders, 18 production batches, 12 purchases, 28 invoices, 15 payments, 200+ stock ledger movements and 30+ audit activities. Every generated business record is marked `DEMO DATA` or registered under a dedicated demo batch key. It refuses to overwrite an existing company profile and is idempotent for a seeded batch. It generates unique, strong passwords and prints them only when creating the accounts; users must change them at first sign-in. Set `DEMO_SEED_PASSWORD` to provide a secure 12+ character password if needed. The legacy demo emails are `demo.admin@srilakshmifoods.example.test`, `demo.sales@srilakshmifoods.example.test`, `demo.production@srilakshmifoods.example.test`, `demo.accounts@srilakshmifoods.example.test` and `demo.owner@srilakshmifoods.example.test`.
+
+### Five-role demo accounts
+
+After applying migrations, run the dedicated idempotent account seeder:
+
+```powershell
+cd backend
+$env:DEMO_MODE = "true"
+python seed_roles.py
+```
+
+It creates the requested common-application accounts, generates a separate strong password for each new account, and prints each password once in the development terminal. Save those values securely; subsequent runs do not reset or reveal existing passwords. To set individual passwords before first creation, configure `DEMO_OWNER_PASSWORD`, `DEMO_FACTORY_ADMIN_PASSWORD`, `DEMO_SALESMAN_PASSWORD`, `DEMO_PRODUCTION_PASSWORD`, or `DEMO_AUDITOR_PASSWORD` with a strong 12+ character value.
+
+| Dashboard / role | Demo username |
+|---|---|
+| Owner Command Center | `owner@nutriledger.demo` |
+| Factory Administration Dashboard | `admin@nutriledger.demo` |
+| Sales & Order Dashboard | `sales@nutriledger.demo` |
+| Production Control Center | `production@nutriledger.demo` |
+| Finance & Audit Dashboard | `auditor@nutriledger.demo` |
+
+Users share one login page. The role stored on the account determines navigation and the post-login route: `/owner/dashboard`, `/admin/dashboard`, `/sales/dashboard`, `/production/dashboard`, or `/accountant/dashboard`. Sales accounts see only assigned customers and their own orders; accountancy is read-only. Factory Admins can create operational accounts, while only Owners may assign Owner or Factory Admin roles.
 
 The dashboard, customer directory, supplier directory and order register read their values from database queries. Order approval/fulfilment and payment are shown as separate states, and stock balances continue to come from signed ledger movements.
 
@@ -116,23 +142,15 @@ npm run dev
 
 Vite runs at `http://localhost:5173`. Set `VITE_API_URL` if the API is hosted elsewhere. To use PostgreSQL locally, set `DATABASE_URL` to a `postgresql+psycopg://...` connection URL before running Alembic or Uvicorn.
 
-## Development demo credentials
+## Password reset and deployment
 
-All seeded users use the development-only password `NutriLedger2026!`:
+In `DEMO_MODE=true`, password-reset requests return a one-time development token to the login page when SMTP is not configured. In production, configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, and optionally `SMTP_USERNAME`, `SMTP_PASSWORD`, and `SMTP_USE_TLS`; reset instructions are emailed and tokens expire after one hour. The production API does not expose reset tokens in responses.
 
-| Role | Email |
-|---|---|
-| Admin | `admin@nutriledger.local` |
-| Salesman | `sales.a@nutriledger.local` |
-| Production Supervisor | `production@nutriledger.local` |
-| Accountant / Auditor | `accountant@nutriledger.local` |
-| Owner | `owner@nutriledger.local` |
-
-Never use these accounts or password in a production environment.
+For production, set `DEMO_MODE=false`, a unique random `JWT_SECRET` of at least 32 characters, `COOKIE_SECURE=true`, trusted `CORS_ORIGINS`, and SMTP settings. Serve the frontend and API over HTTPS. Demo account passwords are never embedded in frontend code or checked into documentation.
 
 ## Benchmark data and verification
 
-`python seed.py` creates the benchmark opening inventory, Murukku 200 g product/BOM, Retailer A (Tamil Nadu), Distributor B (Karnataka), sample supplier and five development users. Then run one purchase (60 kg flour at ₹45/kg), one production batch (200 planned, 188 good, actual oil 10.5 L, damaged 6 pouches, 9 cartons), one 150-packet Retailer A order/invoice/dispatch, a ₹4,000 payment, and finally a 120-packet Distributor B order.
+`python seed.py` creates the benchmark opening inventory, Murukku 200 g product/BOM, Retailer A (Tamil Nadu), Distributor B (Karnataka), sample supplier and five legacy development users with randomly generated one-time passwords. `python seed_roles.py` creates the five requested `@nutriledger.demo` accounts. Both seeders refuse to run when `DEMO_MODE=false`. Then run one purchase (60 kg flour at ₹45/kg), one production batch (200 planned, 188 good, actual oil 10.5 L, damaged 6 pouches, 9 cartons), one 150-packet Retailer A order/invoice/dispatch, a ₹4,000 payment, and finally a 120-packet Distributor B order.
 
 Expected ledger results:
 
@@ -154,7 +172,10 @@ python -m pytest -q
 
 ## Security and operations notes
 
-- Passwords are never stored in clear text. JWT tokens are signed using `JWT_SECRET`.
+- Passwords are Argon2id-hashed and never stored in clear text. Existing PBKDF2 credentials are verified and upgraded to Argon2id after a successful login.
+- JWTs expire, are stored in HttpOnly cookies, and are checked against the user's token version. Logout, password changes, password resets, role changes and account deactivation revoke existing sessions. Cookie-authenticated writes require a CSRF token.
+- Login attempts are throttled, inactive accounts cannot authenticate, and password reset uses one-time hashed tokens. Demo reset tokens are only returned while `DEMO_MODE=true`.
+- API role checks and salesperson data scoping are enforced server-side; frontend route guards are an additional UX layer, not the security boundary.
 - Important posted transactions create audit rows. Inventory is derived from append-only source-referenced movements; application endpoints do not expose direct stock balance editing.
 - Monetary calculations use Python `Decimal` and SQL `NUMERIC` columns.
 - Orders can be submitted even when stock is short so the shortage is visible; approval and dispatch reject insufficient inventory.
@@ -162,15 +183,11 @@ python -m pytest -q
 - Production material cost uses a weighted-average rate snapshot at issue time. Labor and utility expenses can be recorded against a run and are allocated over its good output for the cost-per-packet report.
 - Schema `create_all` is currently retained for convenient development startup; use Alembic as the deployment schema authority.
 
-## Known limitations
+## Remaining product limitations
 
-This is a functional implementation of the core operational workflows, not yet the full production-ready ERP described by the broader requirements. In particular:
-
-- Credit notes/cancellations, user administration, settings, supplier screens, customer/product editing, and assignment-based customer scope remain to be built. BOM editing and expense capture are available.
-- Reports cover the principal sales, GST, stock, production, costing and receivables summaries, but not every requested filtered register/analytics view.
-- The PDF invoice includes core invoice/tax information but does not yet include configurable company GSTIN/address, full tax columns and legal invoice metadata.
-- Frontend support for partial dispatch and payments uses simple prompts; polished validation dialogs and a dedicated mobile salesman interface remain follow-up work.
-- The API lacks rate limiting, refresh/revocation tokens and a production secret manager. Review deployment security before exposing it publicly.
-- Alembic currently has a baseline schema migration; future schema changes should be created as new revisions.
+- Supplier editing, complete customer/product maintenance fields, credit notes/cancellations, and configurable invoice legal metadata are not yet available.
+- Partial-dispatch and payment entry still use simple browser prompts; reports cover the principal business registers rather than every possible filtered analytics view.
+- SMTP delivery must be configured for production password reset; demo token display is development-only.
+- There is no refresh-token flow; sessions use expiring access tokens and server-side version revocation.
 
 See [DESIGN.md](./DESIGN.md) for stock ledger, BOM, tax and costing assumptions.

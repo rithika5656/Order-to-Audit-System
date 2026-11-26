@@ -1,10 +1,15 @@
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, false, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
+
+
+def _username_default(context):
+    email = context.get_current_parameters().get("email", "")
+    return email.split("@", 1)[0].strip().lower()[:80]
 
 
 class Role(Base):
@@ -17,10 +22,18 @@ class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120))
+    username: Mapped[str] = mapped_column(String(80), unique=True, index=True, default=_username_default)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(ForeignKey("roles.code"), index=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default=func.current_timestamp(),
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    token_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
 
 class Customer(Base):
@@ -33,6 +46,36 @@ class Customer(Base):
     contact: Mapped[str | None] = mapped_column(String(80), nullable=True)
     billing_address: Mapped[str | None] = mapped_column(Text, nullable=True)
     credit_limit: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0"))
+    assigned_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    assigned_user: Mapped[User | None] = relationship()
+
+
+class LoginActivity(Base):
+    __tablename__ = "login_activities"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    email: Mapped[str] = mapped_column(String(255), index=True)
+    successful: Mapped[bool] = mapped_column(Boolean)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class LoginAttempt(Base):
+    __tablename__ = "login_attempts"
+    identifier: Mapped[str] = mapped_column(String(64), primary_key=True)
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class Product(Base):

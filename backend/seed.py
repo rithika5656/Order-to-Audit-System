@@ -1,5 +1,6 @@
 from decimal import Decimal
 import os
+import secrets
 
 from sqlalchemy import select
 
@@ -18,7 +19,7 @@ def seed():
             print("Seed data already exists; no changes made.")
             return
 
-        roles = ["Admin", "Salesman", "Production Supervisor", "Accountant / Auditor", "Owner"]
+        roles = ["Admin", "Factory Admin", "Salesman", "Production Supervisor", "Accountant / Auditor", "Owner"]
         db.add_all([Role(code=role, description=f"{role} application role") for role in roles])
         db.flush()
         users = [
@@ -28,8 +29,14 @@ def seed():
             ("Accountant", "accountant@nutriledger.local", "Accountant / Auditor"),
             ("Business Owner", "owner@nutriledger.local", "Owner"),
         ]
+        credentials = []
         for name, email, role in users:
-            db.add(User(name=name, email=email, role=role, password_hash=hash_password("NutriLedger2026!")))
+            password = f"{secrets.token_urlsafe(24)}aA1!"
+            db.add(User(
+                name=name, email=email, role=role, password_hash=hash_password(password),
+                must_change_password=True,
+            ))
+            credentials.append((email, password))
 
         product = Product(name="Murukku 200 g", sku="MUR-200", category="Traditional Snacks",
                           pack_size="200 g", selling_price=Decimal("50.00"),
@@ -73,6 +80,9 @@ def seed():
                                 source_type="opening_balance", source_id="OPEN-MUR-200"))
         db.commit()
         print("Created benchmark data and five demo users (development only).")
+        print("Generated one-time passwords (save securely; users must change them at first sign-in):")
+        for email, password in credentials:
+            print(f"{email}: {password}")
     except Exception:
         db.rollback()
         raise

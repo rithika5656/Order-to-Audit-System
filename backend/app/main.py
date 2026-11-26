@@ -1,28 +1,43 @@
 import os
 import csv
+import hashlib
+import secrets
+import smtplib
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from email.message import EmailMessage
 from io import BytesIO, StringIO
+from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
 from .models import (
     AuditLog, BomItem, CompanyProfile, Customer, Dispatch, Expense, InventoryLot,
-    InventoryLotAllocation, InventoryMovement, Invoice, Order, Payment, Product,
-    ProductionConsumption, ProductionRun, Purchase, RawMaterial, Supplier,
-    SupplierMaterial, User,
+    InventoryLotAllocation, InventoryMovement, Invoice, LoginActivity, LoginAttempt,
+    Order, PasswordResetToken, Payment, Product, ProductionConsumption, ProductionRun,
+    Purchase, RawMaterial, Role, Supplier, SupplierMaterial, User,
 )
 from .schemas import (
-    LoginRequest, OrderRequest, PaymentRequest, ProductionRequest, PurchaseRequest,
-    ReorderPolicyRequest,
+    AdminPasswordResetRequest, CustomerAssignmentRequest, ForgotPasswordRequest,
+    LoginRequest, OrderEditRequest, OrderRequest, PasswordChangeRequest,
+    PasswordResetRequest, PaymentRequest, ProductUpdateRequest, ProductionRequest,
+    PurchaseRequest, ReorderPolicyRequest, UserCreateRequest, UserUpdateRequest,
 )
-from .security import create_token, current_user, hash_password, require_roles, verify_password
+from .security import (
+    DEMO_MODE, create_token, current_user, hash_password, password_hasher,
+    require_roles, verify_password,
+)
+from .roles import (
+    ACCOUNTANT_AUDITOR, FACTORY_ADMIN, OWNER, PRODUCTION_SUPERVISOR, ROLES,
+    SALESMAN, canonical_role,
+)
 from .services import (
     add_movement, available_for_order, balance, bom_expected, build_invoice, create_lot,
     dispatched, lot_balance, lot_summary, money, outstanding, stock_intelligence,
@@ -33,17 +48,25 @@ app = FastAPI(title="NutriLedger API", version="1.0.0")
 origins = os.getenv(
     "CORS_ORIGINS",
     "http://localhost:5173,http://localhost:8080,http://127.0.0.1:8080",
-).split(",")
+)
+origins = [origin.strip() for origin in origins.split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware, allow_origins=origins, allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 Base.metadata.create_all(bind=engine)
 
-ADMIN = ("Admin",)
-PRODUCTION = ("Admin", "Production Supervisor")
-SALES = ("Admin", "Salesman")
-FINANCE = ("Admin", "Accountant / Auditor", "Owner")
+ADMIN = (FACTORY_ADMIN,)
+PRODUCTION = (FACTORY_ADMIN, PRODUCTION_SUPERVISOR)
+SALES = (FACTORY_ADMIN, SALESMAN)
+FINANCE = (FACTORY_ADMIN, ACCOUNTANT_AUDITOR, OWNER)
+USER_MANAGERS = (FACTORY_ADMIN, OWNER)
+COOKIE_NAME = "nutriledger_access"
+CSRF_COOKIE_NAME = "nutriledger_csrf"
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_LOCKOUT = timedelta(minutes=15)
+RESET_TOKEN_LIFETIME = timedelta(hours=1)
+_dummy_password_hash = hash_password("not-a-real-user-password")
 
 
 def audit(db: Session, user: User | None, action: str, entity: str, entity_id: str):
@@ -54,24 +77,392 @@ def reference(prefix: str, value: str):
     return f"{prefix}-{value.strip()}"
 
 
+def _secure_cookie():
+    return os.getenv("COOKIE_SECURE", "false" if DEMO_MODE else "true").lower() == "true"
+
+
+def _set_session_cookies(response: Response, user: User, remember_me: bool = False):
+    lifetime = (
+        int(os.getenv("JWT_REMEMBER_EXPIRE_DAYS", "14")) * 24 * 60 * 60
+        if remember_me else int(os.getenv("JWT_EXPIRE_MINUTES", "60")) * 60
+    )
+    csrf_token = secrets.token_urlsafe(32)
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=create_token(user, remember_me=remember_me),
+        max_age=lifetime if remember_me else None,
+        httponly=True,
+        secure=_secure_cookie(),
+        samesite="lax",
+        path="/",
+    )
+    response.set_cookie(
+        key=CSRF_COOKIE_NAME,
+        value=csrf_token,
+        max_age=lifetime if remember_me else None,
+        httponly=False,
+        secure=_secure_cookie(),
+        samesite="lax",
+        path="/",
+    )
+    return csrf_token
+
+
+@app.middleware("http")
+async def protect_cookie_authenticated_requests(request: Request, call_next):
+    if (
+        request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        and request.cookies.get(COOKIE_NAME)
+        and request.url.path != "/api/auth/login"
+    ):
+        cookie_token = request.cookies.get(CSRF_COOKIE_NAME, "")
+        header_token = request.headers.get("X-CSRF-Token", "")
+        if not cookie_token or not secrets.compare_digest(cookie_token, header_token):
+            return JSONResponse(status_code=403, content={"detail": "CSRF token is missing or invalid."})
+    return await call_next(request)
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "NutriLedger"}
 
 
 @app.post("/api/auth/login")
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    user = db.scalar(select(User).where(User.email == payload.email.lower()))
-    if user is None or not user.active or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    return {"access_token": create_token(user), "token_type": "bearer", "user": {
-        "id": user.id, "name": user.name, "email": user.email, "role": user.role,
+def login(
+    payload: LoginRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    now = datetime.utcnow()
+    remote = request.client.host if request.client else "unknown"
+    throttle_key = hashlib.sha256(f"{remote}:{payload.email}".encode()).hexdigest()
+    attempt = db.get(LoginAttempt, throttle_key)
+    if attempt and attempt.locked_until and attempt.locked_until > now:
+        db.add(LoginActivity(
+            user_id=None, email=payload.email, successful=False, ip_address=remote, created_at=now,
+        ))
+        db.commit()
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again in 15 minutes.")
+    if attempt and now - attempt.updated_at > LOGIN_LOCKOUT:
+        attempt.failed_attempts = 0
+        attempt.locked_until = None
+    elif attempt and attempt.locked_until:
+        attempt.failed_attempts = 0
+        attempt.locked_until = None
+
+    user = db.scalar(select(User).where(or_(
+        func.lower(User.email) == payload.email,
+        func.lower(User.username) == payload.email,
+    )))
+    password_ok = verify_password(payload.password, user.password_hash if user else _dummy_password_hash)
+    if user is None or not user.active or not password_ok:
+        if attempt is None:
+            attempt = LoginAttempt(identifier=throttle_key, failed_attempts=0)
+            db.add(attempt)
+        attempt.failed_attempts += 1
+        attempt.updated_at = now
+        if attempt.failed_attempts >= LOGIN_MAX_ATTEMPTS:
+            attempt.locked_until = now + LOGIN_LOCKOUT
+        db.add(LoginActivity(
+            user_id=user.id if user else None,
+            email=payload.email,
+            successful=False,
+            ip_address=remote,
+            created_at=now,
+        ))
+        db.commit()
+        if attempt.locked_until:
+            raise HTTPException(status_code=429, detail="Too many login attempts. Try again in 15 minutes.")
+        raise HTTPException(status_code=401, detail="Invalid username/email or password")
+
+    if not user.password_hash.startswith("$argon2") or password_hasher.check_needs_rehash(user.password_hash):
+        user.password_hash = hash_password(payload.password)
+    user.last_login_at = now
+    if attempt:
+        db.delete(attempt)
+    db.add(LoginActivity(
+        user_id=user.id, email=user.email, successful=True, ip_address=remote, created_at=now,
+    ))
+    db.commit()
+    csrf_token = _set_session_cookies(response, user, remember_me=payload.remember_me)
+    return {"csrf_token": csrf_token, "user": {
+        "id": user.id, "name": user.name, "username": user.username,
+        "email": user.email, "role": canonical_role(user.role),
+        "must_change_password": user.must_change_password,
     }}
 
 
 @app.get("/api/auth/me")
-def me(user: User = Depends(current_user)):
-    return {"id": user.id, "name": user.name, "email": user.email, "role": user.role}
+def me(request: Request, user: User = Depends(current_user)):
+    return {
+        "id": user.id, "name": user.name, "username": user.username,
+        "email": user.email, "role": canonical_role(user.role),
+        "must_change_password": user.must_change_password,
+        "csrf_token": request.cookies.get(CSRF_COOKIE_NAME),
+    }
+
+
+@app.post("/api/auth/logout")
+def logout(response: Response, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    user.token_version += 1
+    db.commit()
+    response.delete_cookie(COOKIE_NAME, path="/", httponly=True, samesite="lax")
+    response.delete_cookie(CSRF_COOKIE_NAME, path="/", samesite="lax")
+    return {"message": "Signed out"}
+
+
+def _send_password_reset(email: str, token: str):
+    host = os.getenv("SMTP_HOST")
+    sender = os.getenv("SMTP_FROM")
+    if not host or not sender:
+        raise HTTPException(status_code=503, detail="Password reset email is not configured.")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    base_url = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173").rstrip("/")
+    reset_link = f"{base_url}/reset-password?email={quote(email)}&token={quote(token)}"
+    message = EmailMessage()
+    message["Subject"] = "Reset your NutriLedger password"
+    message["From"] = sender
+    message["To"] = email
+    message.set_content(f"Use this link within one hour to reset your NutriLedger password:\n\n{reset_link}")
+    with smtplib.SMTP(host, port, timeout=10) as smtp:
+        if os.getenv("SMTP_USE_TLS", "true").lower() == "true":
+            smtp.starttls()
+        username = os.getenv("SMTP_USERNAME")
+        password = os.getenv("SMTP_PASSWORD")
+        if username and password:
+            smtp.login(username, password)
+        smtp.send_message(message)
+
+
+@app.post("/api/auth/password-reset/request")
+def request_password_reset(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    if not DEMO_MODE and (not os.getenv("SMTP_HOST") or not os.getenv("SMTP_FROM")):
+        raise HTTPException(status_code=503, detail="Password reset email is not configured.")
+    user = db.scalar(select(User).where(func.lower(User.email) == payload.email))
+    result = {"message": "If that account exists, password reset instructions have been sent."}
+    if user is None or not user.active:
+        if DEMO_MODE:
+            result["development_token"] = None
+        return result
+    now = datetime.utcnow()
+    for existing in db.scalars(select(PasswordResetToken).where(
+        PasswordResetToken.user_id == user.id, PasswordResetToken.used_at.is_(None),
+    )):
+        existing.used_at = now
+    token = secrets.token_urlsafe(32)
+    reset_record = PasswordResetToken(
+        user_id=user.id,
+        token_hash=hashlib.sha256(token.encode()).hexdigest(),
+        created_at=now,
+        expires_at=now + RESET_TOKEN_LIFETIME,
+    )
+    db.add(reset_record)
+    if DEMO_MODE and (not os.getenv("SMTP_HOST") or not os.getenv("SMTP_FROM")):
+        db.commit()
+        result["development_token"] = token
+        return result
+    try:
+        _send_password_reset(user.email, token)
+    except (OSError, smtplib.SMTPException) as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Password reset email could not be sent.") from exc
+    db.commit()
+    return result
+
+
+@app.post("/api/auth/password-reset")
+def reset_password(
+    payload: PasswordResetRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    token_hash = hashlib.sha256(payload.token.encode()).hexdigest()
+    reset_record = db.scalar(select(PasswordResetToken).where(
+        PasswordResetToken.token_hash == token_hash,
+        PasswordResetToken.used_at.is_(None),
+        PasswordResetToken.expires_at > datetime.utcnow(),
+    ))
+    user = db.get(User, reset_record.user_id) if reset_record else None
+    if user is None or not user.active or user.email.lower() != payload.email:
+        raise HTTPException(status_code=400, detail="Invalid or expired password reset token.")
+    user.password_hash = hash_password(payload.new_password)
+    user.token_version += 1
+    user.must_change_password = False
+    reset_record.used_at = datetime.utcnow()
+    db.commit()
+    response.delete_cookie(COOKIE_NAME, path="/", httponly=True, samesite="lax")
+    response.delete_cookie(CSRF_COOKIE_NAME, path="/", samesite="lax")
+    return {"message": "Password reset successfully. Sign in with your new password."}
+
+
+@app.post("/api/auth/password-change")
+def change_password(
+    payload: PasswordChangeRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    if not verify_password(payload.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Current password is incorrect.")
+    user.password_hash = hash_password(payload.new_password)
+    user.token_version += 1
+    user.must_change_password = False
+    db.commit()
+    csrf_token = _set_session_cookies(response, user)
+    return {"message": "Password changed successfully.", "csrf_token": csrf_token}
+
+
+def _user_record(user: User):
+    return {
+        "id": user.id, "name": user.name, "username": user.username,
+        "email": user.email, "role": canonical_role(user.role), "phone": user.phone,
+        "active": user.active, "created_at": user.created_at.isoformat() if user.created_at else None,
+        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+        "must_change_password": user.must_change_password,
+    }
+
+
+def _may_manage_target(actor: User, target: User):
+    if canonical_role(actor.role) == FACTORY_ADMIN and canonical_role(target.role) in (OWNER, FACTORY_ADMIN):
+        raise HTTPException(status_code=403, detail="Factory Admin cannot manage Owner or Factory Admin accounts.")
+
+
+@app.get("/api/users")
+def list_users(db: Session = Depends(get_db), user: User = Depends(require_roles(*USER_MANAGERS))):
+    records = list(db.scalars(select(User).order_by(User.name, User.id)))
+    if canonical_role(user.role) == FACTORY_ADMIN:
+        records = [record for record in records if canonical_role(record.role) not in (OWNER, FACTORY_ADMIN)]
+    return [_user_record(record) for record in records]
+
+
+@app.post("/api/users")
+def create_user(
+    payload: UserCreateRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*USER_MANAGERS)),
+):
+    requested_role = canonical_role(payload.role)
+    if canonical_role(user.role) == FACTORY_ADMIN and requested_role not in (
+        SALESMAN, PRODUCTION_SUPERVISOR, ACCOUNTANT_AUDITOR,
+    ):
+        raise HTTPException(status_code=403, detail="Factory Admin may only assign operational roles.")
+    if db.scalar(select(User.id).where(or_(
+        func.lower(User.email) == payload.email,
+        func.lower(User.username) == payload.username,
+    ))):
+        raise HTTPException(status_code=409, detail="Username or email is already in use.")
+    if db.get(Role, requested_role) is None:
+        raise HTTPException(status_code=422, detail="The selected role is not configured.")
+    record = User(
+        name=payload.name.strip(), username=payload.username, email=payload.email,
+        password_hash=hash_password(payload.password), role=requested_role,
+        phone=payload.phone, active=True, must_change_password=True,
+    )
+    db.add(record)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Username or email is already in use.") from exc
+    db.refresh(record)
+    audit(db, user, "created", "user", str(record.id))
+    db.commit()
+    return _user_record(record)
+
+
+@app.patch("/api/users/{user_id}")
+def update_user(
+    user_id: int,
+    payload: UserUpdateRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*USER_MANAGERS)),
+):
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if user.id != target.id:
+        _may_manage_target(user, target)
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="Provide at least one user field to update.")
+    if user.id == target.id and (changes.get("active") is False or "role" in changes):
+        raise HTTPException(status_code=400, detail="You cannot deactivate or change your own role.")
+    if ("name" in changes and changes["name"] is None) or (
+        "active" in changes and changes["active"] is None
+    ):
+        raise HTTPException(status_code=422, detail="Name and account status cannot be empty.")
+    if "role" in changes and changes["role"] is None:
+        raise HTTPException(status_code=422, detail="Role cannot be empty.")
+    next_role = canonical_role(changes.get("role", target.role))
+    if "role" in changes and canonical_role(user.role) == FACTORY_ADMIN and next_role in (OWNER, FACTORY_ADMIN):
+        raise HTTPException(status_code=403, detail="Factory Admin may not assign privileged roles.")
+    previous_role = canonical_role(target.role)
+    next_active = changes.get("active", target.active)
+    if previous_role == FACTORY_ADMIN and target.active and (
+        next_role != FACTORY_ADMIN or not next_active
+    ):
+        active_admins = db.scalar(select(func.count(User.id)).where(
+            User.id != target.id, User.active.is_(True), User.role.in_(("Admin", FACTORY_ADMIN)),
+        )) or 0
+        if active_admins == 0:
+            raise HTTPException(status_code=409, detail="At least one active Factory Admin account must remain.")
+    if previous_role == OWNER and target.active and (next_role != OWNER or not next_active):
+        active_owners = db.scalar(select(func.count(User.id)).where(
+            User.id != target.id, User.active.is_(True), User.role == OWNER,
+        )) or 0
+        if active_owners == 0:
+            raise HTTPException(status_code=409, detail="At least one active Owner account must remain.")
+    if any(changes.get(key) != getattr(target, key) for key in ("role", "active") if key in changes):
+        target.token_version += 1
+    for key in ("name", "phone", "active"):
+        if key in changes:
+            setattr(target, key, changes[key])
+    if "role" in changes:
+        target.role = next_role
+    audit(db, user, "updated", "user", str(target.id))
+    db.commit()
+    return _user_record(target)
+
+
+@app.post("/api/users/{user_id}/reset-password")
+def admin_reset_user_password(
+    user_id: int,
+    payload: AdminPasswordResetRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*USER_MANAGERS)),
+):
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+    _may_manage_target(user, target)
+    target.password_hash = hash_password(payload.new_password)
+    target.token_version += 1
+    target.must_change_password = True
+    audit(db, user, "password_reset", "user", str(target.id))
+    db.commit()
+    return {"message": "Password reset. The user must change it at next login."}
+
+
+@app.get("/api/users/{user_id}/login-activity")
+def user_login_activity(
+    user_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*USER_MANAGERS)),
+):
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+    _may_manage_target(user, target)
+    records = db.scalars(
+        select(LoginActivity).where(LoginActivity.user_id == target.id)
+        .order_by(LoginActivity.created_at.desc()).limit(100)
+    )
+    return [{
+        "created_at": row.created_at.isoformat(),
+        "successful": row.successful,
+        "ip_address": row.ip_address,
+    } for row in records]
 
 
 @app.get("/api/dashboard")
@@ -79,7 +470,7 @@ def dashboard(
     from_date: date | None = None,
     to_date: date | None = None,
     db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(require_roles(*FINANCE)),
 ):
     today = date.today()
     chart_start = from_date or today - timedelta(days=29)
@@ -425,8 +816,10 @@ def dashboard(
 
 @app.get("/api/products")
 def products(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    confidential_price = canonical_role(user.role) == PRODUCTION_SUPERVISOR
     return [{"id": p.id, "name": p.name, "sku": p.sku, "category": p.category,
-             "pack_size": p.pack_size, "unit": p.unit, "selling_price": str(p.selling_price),
+             "pack_size": p.pack_size, "unit": p.unit,
+             "selling_price": None if confidential_price else str(p.selling_price),
              "gst_rate": str(p.gst_rate), "hsn_code": p.hsn_code, "active": p.active,
              "reorder_level": str(p.reorder_level),
              "stock": str(balance(db, "finished", p.id))}
@@ -457,10 +850,42 @@ def create_product(payload: dict, db: Session = Depends(get_db), user: User = De
     return {"id": product.id, "name": product.name, "sku": product.sku}
 
 
+@app.patch("/api/products/{product_id}")
+def update_product(
+    product_id: int,
+    payload: ProductUpdateRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*ADMIN)),
+):
+    product = db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found.")
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="Provide at least one product field to update.")
+    if any(value is None for value in changes.values()):
+        raise HTTPException(status_code=422, detail="Product fields cannot be empty.")
+    for key, value in changes.items():
+        setattr(product, key, value.strip() if isinstance(value, str) else value)
+    audit(db, user, "updated", "product", str(product.id))
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Product name or SKU already exists.") from exc
+    return {"id": product.id, "name": product.name, "sku": product.sku, "selling_price": str(product.selling_price)}
+
+
 @app.get("/api/customers")
-def customers(db: Session = Depends(get_db), user: User = Depends(current_user)):
+def customers(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*SALES, OWNER)),
+):
     result = []
-    for customer in db.scalars(select(Customer).order_by(Customer.name)).all():
+    query = select(Customer).order_by(Customer.name)
+    if canonical_role(user.role) == SALESMAN:
+        query = query.where(Customer.assigned_user_id == user.id)
+    for customer in db.scalars(query).all():
         customer_invoices = list(db.scalars(
             select(Invoice).join(Order, Invoice.order_id == Order.id)
             .where(Order.customer_id == customer.id)
@@ -473,6 +898,8 @@ def customers(db: Session = Depends(get_db), user: User = Depends(current_user))
             "billing_address": customer.billing_address,
             "credit_limit": str(customer.credit_limit),
             "outstanding_balance": str(money(due)),
+            "assigned_user_id": customer.assigned_user_id,
+            "assigned_user": customer.assigned_user.name if customer.assigned_user else None,
         })
     return result
 
@@ -526,14 +953,43 @@ def create_customer(payload: dict, db: Session = Depends(get_db), user: User = D
     return {"id": customer.id, "name": customer.name}
 
 
+@app.put("/api/customers/{customer_id}/assignment")
+def assign_customer(
+    customer_id: int,
+    payload: CustomerAssignmentRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*ADMIN, OWNER)),
+):
+    customer = db.get(Customer, customer_id)
+    if customer is None:
+        raise HTTPException(status_code=404, detail="Customer not found.")
+    assigned_user_id = payload.user_id
+    if assigned_user_id is not None:
+        assigned_user = db.get(User, assigned_user_id)
+        if assigned_user is None or not assigned_user.active or canonical_role(assigned_user.role) != SALESMAN:
+            raise HTTPException(status_code=422, detail="Assign the customer to an active Salesman account.")
+    customer.assigned_user_id = assigned_user_id
+    audit(db, user, "assigned", "customer", str(customer.id))
+    db.commit()
+    return {
+        "id": customer.id,
+        "assigned_user_id": customer.assigned_user_id,
+        "assigned_user": customer.assigned_user.name if customer.assigned_user else None,
+    }
+
+
 @app.get("/api/inventory")
-def inventory(db: Session = Depends(get_db), user: User = Depends(current_user)):
+def inventory(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*PRODUCTION, *FINANCE)),
+):
     materials = list(db.scalars(select(RawMaterial).order_by(RawMaterial.name)))
     products = list(db.scalars(select(Product).order_by(Product.name)))
+    may_view_costs = canonical_role(user.role) != PRODUCTION_SUPERVISOR
     return {
         "materials": [{
             **stock_intelligence(db, "material", material),
-            "weighted_average_cost": str(material.weighted_average_cost),
+            **({"weighted_average_cost": str(material.weighted_average_cost)} if may_view_costs else {}),
             "lots": lot_summary(db, "material", material.id),
         } for material in materials],
         "finished_goods": [{
@@ -565,7 +1021,7 @@ def update_reorder_policy(
 
 
 @app.get("/api/inventory/ledger")
-def ledger(db: Session = Depends(get_db), user: User = Depends(current_user)):
+def ledger(db: Session = Depends(get_db), user: User = Depends(require_roles(*PRODUCTION, *FINANCE))):
     rows = list(db.scalars(
         select(InventoryMovement).order_by(InventoryMovement.created_at.desc()).limit(500)
     ))
@@ -705,16 +1161,73 @@ def create_production(payload: ProductionRequest, db: Session = Depends(get_db),
 
 
 @app.get("/api/production-runs")
-def list_production_runs(db: Session = Depends(get_db), user: User = Depends(current_user)):
+def list_production_runs(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*PRODUCTION, *FINANCE)),
+):
     runs = db.scalars(select(ProductionRun).order_by(ProductionRun.created_at.desc()))
-    return [{
-        "id": run.id, "reference": run.reference,
-        "product": db.get(Product, run.product_id).name,
-        "expected_output": run.expected_output, "good_output": run.good_output,
-        "damaged": run.damaged, "yield_variance_percent": str(run.yield_variance),
-        "variance_alert": abs(run.yield_variance) > Decimal("3"),
-        "created_at": run.created_at.isoformat(),
-    } for run in runs]
+    result = []
+    for run in runs:
+        expected = bom_expected(db, run.product_id, run.expected_output)
+        actual = {
+            row.material_id: row.quantity for row in db.scalars(
+                select(ProductionConsumption).where(ProductionConsumption.production_run_id == run.id)
+            )
+        }
+        variances = []
+        for material_id, planned_quantity in expected.items():
+            actual_quantity = actual.get(material_id, Decimal("0"))
+            variances.append({
+                "material": db.get(RawMaterial, material_id).name,
+                "expected": str(planned_quantity),
+                "actual": str(actual_quantity),
+                "variance_percent": str(
+                    ((actual_quantity - planned_quantity) / planned_quantity * Decimal("100")).quantize(Decimal("0.1"))
+                    if planned_quantity else Decimal("0")
+                ),
+            })
+        result.append({
+            "id": run.id, "reference": run.reference,
+            "product": db.get(Product, run.product_id).name,
+            "expected_output": run.expected_output, "good_output": run.good_output,
+            "damaged": run.damaged, "yield_variance_percent": str(run.yield_variance),
+            "variance_alert": abs(run.yield_variance) > Decimal("3"),
+            "status": run.status,
+            "material_variance": variances,
+            "created_at": run.created_at.isoformat(),
+        })
+    return result
+
+
+@app.get("/api/production-schedule")
+def production_schedule(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*PRODUCTION)),
+):
+    orders = db.scalars(select(Order).where(Order.status == "Approved").order_by(Order.created_at))
+    schedule = []
+    for order in orders:
+        requirements = []
+        for item in db.scalars(select(BomItem).where(BomItem.product_id == order.product_id)):
+            required = item.quantity * Decimal(order.quantity) / item.per_output
+            available = balance(db, "material", item.material_id)
+            requirements.append({
+                "material": item.material.name,
+                "required": str(required),
+                "available": str(available),
+                "shortage": str(max(Decimal("0"), required - available)),
+                "unit": item.material.unit,
+            })
+        schedule.append({
+            "order_id": order.id,
+            "order_reference": order.reference,
+            "customer": order.customer.name,
+            "product": order.product.name,
+            "quantity": order.quantity,
+            "created_at": order.created_at.isoformat(),
+            "material_requirements": requirements,
+        })
+    return schedule
 
 
 @app.post("/api/production-runs/{run_id}/expenses")
@@ -769,7 +1282,11 @@ def production_costing(run_id: int, db: Session = Depends(get_db), user: User = 
 
 
 @app.get("/api/bom/{product_id}")
-def get_bom(product_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+def get_bom(
+    product_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*PRODUCTION, OWNER)),
+):
     return [{"material_id": item.material_id, "material": item.material.name,
              "quantity": str(item.quantity), "unit": item.material.unit,
              "per_output": str(item.per_output)}
@@ -815,6 +1332,8 @@ def create_order(payload: OrderRequest, db: Session = Depends(get_db), user: Use
     customer, product = db.get(Customer, payload.customer_id), db.get(Product, payload.product_id)
     if customer is None or product is None:
         raise HTTPException(status_code=404, detail="Customer or product not found")
+    if canonical_role(user.role) == SALESMAN and customer.assigned_user_id != user.id:
+        raise HTTPException(status_code=403, detail="You may only place orders for assigned customers.")
     ref = reference("ORD", f"{datetime.utcnow():%Y%m%d%H%M%S%f}")
     order = Order(reference=ref, customer_id=customer.id, product_id=product.id,
                   quantity=payload.quantity, unit_price=product.selling_price,
@@ -828,10 +1347,46 @@ def create_order(payload: OrderRequest, db: Session = Depends(get_db), user: Use
             "available_stock": stock, "shortage": str(max(0, payload.quantity - stock))}
 
 
+@app.put("/api/orders/{order_id}")
+def edit_order(
+    order_id: int,
+    payload: OrderEditRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*ADMIN)),
+):
+    order = db.get(Order, order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found.")
+    if order.status != "Submitted":
+        raise HTTPException(status_code=409, detail="Only submitted orders can be edited.")
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="Provide at least one order field to update.")
+    if "customer_id" in changes:
+        customer = db.get(Customer, changes["customer_id"])
+        if customer is None:
+            raise HTTPException(status_code=404, detail="Customer not found.")
+        order.customer_id = customer.id
+    if "product_id" in changes:
+        product = db.get(Product, changes["product_id"])
+        if product is None or not product.active:
+            raise HTTPException(status_code=404, detail="Active product not found.")
+        order.product_id = product.id
+        order.unit_price = product.selling_price
+    if "quantity" in changes:
+        order.quantity = changes["quantity"]
+    audit(db, user, "edited", "order", order.reference)
+    db.commit()
+    return {"id": order.id, "reference": order.reference, "status": order.status}
+
+
 @app.get("/api/orders")
-def list_orders(db: Session = Depends(get_db), user: User = Depends(current_user)):
+def list_orders(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*SALES, OWNER)),
+):
     query = select(Order).order_by(Order.created_at.desc())
-    if user.role == "Salesman":
+    if canonical_role(user.role) == SALESMAN:
         query = query.where(Order.created_by == user.id)
     result = []
     for order in db.scalars(query).all():
@@ -935,8 +1490,14 @@ def invoice_order(order_id: int, db: Session = Depends(get_db), user: User = Dep
 
 
 @app.get("/api/invoices")
-def list_invoices(db: Session = Depends(get_db), user: User = Depends(require_roles(*FINANCE))):
-    invoices = db.scalars(select(Invoice).order_by(Invoice.created_at.desc()))
+def list_invoices(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*FINANCE, SALESMAN)),
+):
+    query = select(Invoice).join(Order, Invoice.order_id == Order.id).order_by(Invoice.created_at.desc())
+    if canonical_role(user.role) == SALESMAN:
+        query = query.where(Order.created_by == user.id)
+    invoices = db.scalars(query)
     return [{"id": i.id, "number": i.number, "customer": i.order.customer.name,
              "order_reference": i.order.reference, "taxable": str(i.taxable),
              "cgst": str(i.cgst), "sgst": str(i.sgst), "igst": str(i.igst),
@@ -970,7 +1531,12 @@ def create_dispatch(invoice_id: int, payload: dict, db: Session = Depends(get_db
 
 
 @app.post("/api/invoices/{invoice_id}/payments")
-def record_payment(invoice_id: int, payload: PaymentRequest, db: Session = Depends(get_db), user: User = Depends(require_roles(*FINANCE))):
+def record_payment(
+    invoice_id: int,
+    payload: PaymentRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*ADMIN)),
+):
     invoice = db.get(Invoice, invoice_id)
     if invoice is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
@@ -1154,9 +1720,15 @@ def export_report(
 
 
 @app.get("/api/invoices/{invoice_id}/pdf")
-def invoice_pdf(invoice_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles(*FINANCE))):
+def invoice_pdf(
+    invoice_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*FINANCE, SALESMAN)),
+):
     invoice = db.get(Invoice, invoice_id)
     if invoice is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if canonical_role(user.role) == SALESMAN and invoice.order.created_by != user.id:
         raise HTTPException(status_code=404, detail="Invoice not found")
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas

@@ -193,8 +193,10 @@ def test_demo_seed_is_consistent_idempotent_and_safely_reset(tmp_path):
             "SELECT customer_id, product_id FROM orders LIMIT 1"
         ).fetchone()
         connection.execute(
-            """INSERT INTO users (name, email, password_hash, role, active)
-               VALUES ('Real User', 'real@example.test', 'not-a-login-hash', 'Admin', 1)"""
+            """INSERT INTO users
+               (name, username, email, password_hash, role, active, created_at, token_version, must_change_password)
+               VALUES ('Real User', 'real-user', 'real@example.test', 'not-a-login-hash', 'Admin', 1,
+                       CURRENT_TIMESTAMP, 0, 0)"""
         )
         real_user_id = connection.execute(
             "SELECT id FROM users WHERE email = 'real@example.test'"

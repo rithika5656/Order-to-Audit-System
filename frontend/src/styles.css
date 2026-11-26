@@ -1,4 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap");
+﻿@import url("https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap");
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -667,4 +667,29 @@ tbody tr:hover { background: #f3f7fd; }
     transition-duration: .01ms !important;
     animation: none !important;
   }
+}
+
+.password-field { display: flex; position: relative; }
+.password-field input { width: 100%; padding-right: 42px; }
+.password-toggle { position: absolute; right: 7px; top: 50%; transform: translateY(-50%); border: 0; color: #647897; background: transparent; padding: 6px; }
+.password-toggle:hover { color: var(--royal); }
+.remember-option { display: flex !important; grid-template-columns: auto 1fr; align-items: center; gap: 9px !important; font-size: 12px; color: #536987 !important; }
+.remember-option input { width: 15px; height: 15px; margin: 0; accent-color: var(--royal); }
+.text-button { display: block; margin: 13px auto 0; border: 0; padding: 5px 8px; color: var(--royal); background: transparent; font-size: 13px; font-weight: 600; }
+.text-button:hover { color: var(--navy); text-decoration: underline; }
+.password-hint { display: block; margin: -4px 0 8px; color: var(--muted); font-size: 11px; }
+.login-brand { display: flex; align-items: center; gap: 12px; color: var(--navy); font: 800 20px Manrope, sans-serif; }
+.login-brand small { display: block; margin-top: 5px; color: #71819a; font: 600 9px "DM Sans", sans-serif; letter-spacing: 1.15px; }
+.login-note { color: #77869e; font-size: 11px; line-height: 1.55; text-align: center; }
+.inline-edit { display: grid; min-width: 190px; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: 9px; background: #fff; box-shadow: 0 8px 24px #172b4d12; }
+.inline-edit label, .assignment-field { display: grid; gap: 4px; color: var(--muted); font-size: 11px; }
+.inline-edit input, .assignment-field select, .row-actions select { min-width: 130px; padding: 7px 8px; color: var(--text); background: #fff; border: 1px solid var(--border); border-radius: 7px; }
+.row-actions details { position: relative; }
+.row-actions details[open] .inline-edit { position: absolute; z-index: 4; right: 0; top: 28px; }
+.row-actions summary { list-style: none; cursor: pointer; }
+.row-actions summary::-webkit-details-marker { display: none; }
+@media (max-width: 720px) {
+  .login-brand { font-size: 17px; }
+  .login-brand small { font-size: 8px; }
+  .row-actions { flex-wrap: wrap; }
 }

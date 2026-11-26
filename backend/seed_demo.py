@@ -3,6 +3,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 import os
+import re
+import secrets
 
 from sqlalchemy import func, select
 
@@ -128,7 +130,18 @@ SUPPLIER_MATERIALS = {
     "Nilgiri Packaging Works": ("200 g Laminated Pouch", "Corrugated Carton"),
 }
 
-DEMO_PASSWORD = os.getenv("DEMO_SEED_PASSWORD", "SriLakshmiDemo2026!")
+def demo_password():
+    configured = os.getenv("DEMO_SEED_PASSWORD")
+    if configured:
+        if (
+            len(configured) < 12
+            or not re.search(r"[a-z]", configured)
+            or not re.search(r"[A-Z]", configured)
+            or not re.search(r"\d", configured)
+        ):
+            raise ValueError("DEMO_SEED_PASSWORD must be 12+ characters with uppercase, lowercase, and a number.")
+        return configured
+    return f"{secrets.token_urlsafe(24)}aA1!"
 
 
 def d(value) -> Decimal:
@@ -195,14 +208,18 @@ def seed_demo():
             ))
 
             users = {}
+            demo_credentials = []
             for name, email, role in USER_ROWS:
                 if db.scalar(select(User.id).where(User.email == email)):
                     raise RuntimeError(f"Demo user email already exists but is not registered: {email}")
+                password = demo_password()
                 user = add_row(db, "users", User(
                     name=name, email=email, role=role,
-                    password_hash=hash_password(DEMO_PASSWORD),
+                    password_hash=hash_password(password),
+                    must_change_password=True,
                 ))
                 users[role] = user
+                demo_credentials.append((email, password))
 
             materials = {}
             for index, (name, unit, cost, reorder) in enumerate(MATERIAL_ROWS):
@@ -542,6 +559,9 @@ def seed_demo():
             print("Created: 10 products, 15 raw materials, 8 customers, 10 suppliers, 5 users, 10 recipes.")
             print("Created: 35 orders, 18 production batches, 12 purchases, 28 invoices, 15 payments.")
             print(f"Tagged demo records: {registered} total, {movements} stock movements, {audit_rows} audit activities.")
+            print("Generated one-time passwords (save securely; users must change them at first sign-in):")
+            for email, password in demo_credentials:
+                print(f"{email}: {password}")
             print(f"Orders: {Counter(order.status for order in orders)}")
             print(f"Outstanding on demo invoices: INR {money(sum((outstanding(db, invoice.id) for invoice in invoices), d(0)))}")
     except Exception:

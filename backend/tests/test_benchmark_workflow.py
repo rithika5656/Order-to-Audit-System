@@ -25,7 +25,7 @@ def client():
     db = TestingSession()
     try:
         db.add_all([Role(code=role, description=role) for role in
-                    ["Admin", "Salesman", "Production Supervisor", "Accountant / Auditor", "Owner"]])
+                    ["Admin", "Factory Admin", "Salesman", "Production Supervisor", "Accountant / Auditor", "Owner"]])
         db.flush()
         user = User(name="Admin", email="admin@test.local", role="Admin", password_hash=hash_password("test-password"))
         salesperson = User(name="Sales", email="sales@test.local", role="Salesman", password_hash=hash_password("test-password"))
@@ -77,7 +77,7 @@ def client():
     with TestClient(app) as test_client:
         response = test_client.post("/api/auth/login", json={"email": "admin@test.local", "password": "test-password"})
         assert response.status_code == 200
-        test_client.headers.update({"Authorization": f"Bearer {response.json()['access_token']}"})
+        test_client.headers.update({"X-CSRF-Token": response.json()["csrf_token"]})
         test_client.benchmark_ids = ids
         yield test_client
     app.dependency_overrides.clear()
@@ -272,7 +272,7 @@ def test_expired_lots_are_not_issueable_stock(client):
 def test_role_restrictions_and_negative_inventory(client):
     login_response = client.post("/api/auth/login", json={"email": "sales@test.local", "password": "test-password"})
     assert login_response.status_code == 200
-    client.headers.update({"Authorization": f"Bearer {login_response.json()['access_token']}"})
+    client.headers.update({"X-CSRF-Token": login_response.json()["csrf_token"]})
     forbidden = client.post("/api/purchases", json={
         "material_id": client.benchmark_ids["Flour"], "quantity": "1", "unit_rate": "1", "reference": "X",
     })
@@ -282,7 +282,9 @@ def test_role_restrictions_and_negative_inventory(client):
         json={"minimum_stock": "25", "target_coverage_days": 14},
     )
     assert forbidden_policy.status_code == 403
-    client.headers.update({"Authorization": f"Bearer {client.post('/api/auth/login', json={'email': 'admin@test.local', 'password': 'test-password'}).json()['access_token']}"})
+    admin_login = client.post("/api/auth/login", json={"email": "admin@test.local", "password": "test-password"})
+    assert admin_login.status_code == 200
+    client.headers.update({"X-CSRF-Token": admin_login.json()["csrf_token"]})
     failed_run = client.post("/api/production-runs", json={
         "product_id": client.benchmark_ids["product"], "expected_output": 200,
         "good_output": 188, "damaged": 0, "reference": "RUN-NEGATIVE",
