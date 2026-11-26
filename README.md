@@ -4,6 +4,12 @@ Smart Manufacturing, Inventory & Audit Management for packaged-food businesses.
 
 NutriLedger connects sales orders, GST billing, purchasing, production and stock records in one role-aware web application. The repository has a React/Vite client and FastAPI API backed by PostgreSQL (SQLite is used only as a lightweight local/test option).
 
+## Product preview
+
+![NutriLedger manufacturing, inventory, sales, and audit overview](assets/nutriledger-overview.png)
+
+![NutriLedger login and five role-specific dashboards](assets/nutriledger-roles.png)
+
 ## Features implemented
 
 - One common login with five database-assigned roles and role-specific dashboards.
